@@ -56,6 +56,11 @@ app.on(["GET", "POST"], "/users/:username/posts", async (c) => {
   return proxyToApi(c.req.raw, `/api/users/${username}/posts${query}`);
 });
 
+app.post("/users/:username/inbox", async (c) => {
+  const username = encodeURIComponent(c.req.param("username"));
+  return proxyToApi(c.req.raw, `/api/users/${username}/inbox`);
+});
+
 app.get("/users/:username/outbox", async (c) => {
   const username = encodeURIComponent(c.req.param("username"));
   const query = c.req.url.includes("?") ? c.req.url.slice(c.req.url.indexOf("?")) : "";

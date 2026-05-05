@@ -34,6 +34,7 @@ server URL は外部公開される ActivityPub / WebFinger 用 URL です。
 /.well-known/webfinger  WebFinger
 /users/:username        ActivityPub actor JSON
 /users/:username/outbox ActivityPub outbox
+/users/:username/inbox  ActivityPub inbox
 /posts/:postId          ActivityPub Note object
 ```
 
@@ -42,6 +43,7 @@ server URL は外部公開される ActivityPub / WebFinger 用 URL です。
 - `/.well-known/webfinger` は Hono から `/api/.well-known/webfinger` へ proxy されます
 - `/users/:username` は Hono から `/api/users/:username` へ proxy されます
 - `/users/:username/outbox` は Hono から `/api/users/:username/outbox` へ proxy されます
+- `/users/:username/inbox` は Hono から `/api/users/:username/inbox` へ proxy されます
 - `/posts/:postId` は ActivityPub 用 `Accept` header のときだけ Hono から `/api/posts/:postId` へ proxy されます
 
 ## Backend API
@@ -54,6 +56,7 @@ backend API は Rust server が直接提供する内部向け endpoint です。
 /api/users/:username
 /api/users/:username/posts
 /api/users/:username/outbox
+/api/users/:username/inbox
 /api/posts/:postId
 ```
 
@@ -101,7 +104,7 @@ inbox_url   = {public_base_url}/users/{username}/inbox
 - `actor_url`
 - `outbox_url`
 
-`inbox_url` は field として存在しますが、endpoint 自体は未実装です。
+`inbox_url` は field として存在し、`/users/:username/inbox` で受信します。
 
 ## WebFinger
 
@@ -123,7 +126,6 @@ acct:alice@example.invalid
 
 以下は型や計画にはあるものの、まだ route としては実装されていません。
 
-- `/users/:username/inbox`
 - `/users/:username/followers`
 - `/users/:username/following`
 - media attachment URL
