@@ -1,19 +1,30 @@
-import type { ActorProfile, CreatePostInput, Post, PostPage } from "./types";
+import type { ActorProfile, CreatePostInput, Post, PostPage, SessionPayload } from "./types";
 
 export type LoginInput = {
   username: string;
   password: string;
 };
 
+let csrfToken: string | null = null;
+
+export function setCsrfToken(token: string | null): void {
+  csrfToken = token;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers);
+  if (csrfToken && (init?.method ?? "GET") !== "GET" && (init?.method ?? "GET") !== "HEAD") {
+    headers.set("x-csrf-token", csrfToken);
+  }
+
   const response = await fetch(path, {
+    ...init,
     credentials: "include",
     headers: {
       "content-type": "application/json",
       accept: "application/json",
-      ...(init?.headers ?? {}),
+      ...Object.fromEntries(headers.entries()),
     },
-    ...init,
   });
 
   if (!response.ok) {
@@ -51,11 +62,11 @@ export async function createPost(username: string, input: CreatePostInput): Prom
   });
 }
 
-export async function getSession(): Promise<ActorProfile> {
+export async function getSession(): Promise<SessionPayload> {
   return request("/api/session");
 }
 
-export async function login(input: LoginInput): Promise<ActorProfile> {
+export async function login(input: LoginInput): Promise<SessionPayload> {
   return request("/api/login", {
     method: "POST",
     body: JSON.stringify(input),
@@ -66,6 +77,7 @@ export async function logout(): Promise<void> {
   const response = await fetch("/api/logout", {
     method: "POST",
     credentials: "include",
+    headers: csrfToken ? { "x-csrf-token": csrfToken } : undefined,
   });
 
   if (!response.ok) {

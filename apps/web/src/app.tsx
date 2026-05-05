@@ -8,7 +8,16 @@ import {
   useState,
 } from "react";
 import { Link, Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
-import { createPost, getActor, getPost, getSession, listPosts, login, logout } from "./api";
+import {
+  createPost,
+  getActor,
+  getPost,
+  getSession,
+  listPosts,
+  login,
+  logout,
+  setCsrfToken,
+} from "./api";
 import type { ActorProfile, Post } from "./types";
 
 const defaultUsername = import.meta.env.VITE_DEFAULT_USERNAME ?? "alice";
@@ -59,12 +68,14 @@ function SessionProvider({ children }: { children: ReactNode }) {
       try {
         const current = await getSession();
         if (!cancelled) {
-          setActor(current);
+          setActor(current.actor);
+          setCsrfToken(current.csrf_token);
           setStatus("authenticated");
         }
       } catch {
         if (!cancelled) {
           setActor(null);
+          setCsrfToken(null);
           setStatus("anonymous");
         }
       }
@@ -79,13 +90,15 @@ function SessionProvider({ children }: { children: ReactNode }) {
 
   async function signIn(input: { username: string; password: string }) {
     const current = await login(input);
-    setActor(current);
+    setActor(current.actor);
+    setCsrfToken(current.csrf_token);
     setStatus("authenticated");
   }
 
   async function signOut() {
     await logout();
     setActor(null);
+    setCsrfToken(null);
     setStatus("anonymous");
   }
 

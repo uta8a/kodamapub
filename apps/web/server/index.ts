@@ -6,6 +6,19 @@ const app = new Hono();
 const apiOrigin = process.env.API_ORIGIN ?? "http://server:3000";
 const port = Number(process.env.PORT ?? "5173");
 
+app.use("*", async (c, next) => {
+  await next();
+
+  c.header("x-content-type-options", "nosniff");
+  c.header("x-frame-options", "DENY");
+  c.header("referrer-policy", "same-origin");
+  c.header("permissions-policy", "camera=(), microphone=(), geolocation=()");
+  c.header(
+    "content-security-policy",
+    "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'",
+  );
+});
+
 function wantsActivityPub(request: Request): boolean {
   const accept = request.headers.get("accept") ?? "";
   return accept.includes("application/activity+json") || accept.includes("application/ld+json");
@@ -32,13 +45,30 @@ function copyProxyHeaders(upstream: Response): Headers {
 }
 
 async function proxyToApi(request: Request, path: string): Promise<Response> {
+  const headers: Record<string, string> = {
+    accept: request.headers.get("accept") ?? "application/json",
+    "content-type": request.headers.get("content-type") ?? "application/json",
+    cookie: request.headers.get("cookie") ?? "",
+  };
+
+  for (const name of [
+    "origin",
+    "referer",
+    "x-csrf-token",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "host",
+  ]) {
+    const value = request.headers.get(name);
+    if (value) {
+      headers[name] = value;
+    }
+  }
+
   const upstream = await fetch(`${apiOrigin}${path}`, {
     method: request.method,
-    headers: {
-      accept: request.headers.get("accept") ?? "application/json",
-      "content-type": request.headers.get("content-type") ?? "application/json",
-      cookie: request.headers.get("cookie") ?? "",
-    },
+    headers,
     body:
       request.method === "GET" || request.method === "HEAD"
         ? undefined

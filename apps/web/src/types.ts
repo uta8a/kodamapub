@@ -8,6 +8,11 @@ export type ActorProfile = {
   outbox_url: string | null;
 };
 
+export type SessionPayload = {
+  actor: ActorProfile;
+  csrf_token: string;
+};
+
 export type Post = {
   id: string;
   actor_id: string;
