@@ -1,23 +1,72 @@
 # URL仕様
 
-この文書は、2026-05-05 時点の実装から分かる URL 仕様だけを書いたものです。
+この文書は、2026-05-05 時点の `kodamapub` 実装に基づく URL 仕様です。
 
-まだ router や ActivityPub endpoint はほとんど未実装なので、以下を明確に分けます。
+URL は次の 3 層に分けて扱います。
 
-- すでにコードで確定している URL
-- 型として存在するが、生成規則が未確定な URL
+- `frontend`: ブラウザで人間が見る URL
+- `server`: ActivityPub と WebFinger の公開 URL
+- `backend api`: frontend と Hono proxy が内部的に利用する JSON / ActivityPub API
 
-## 確定している URL
+## Frontend
 
-## 1. ヘルスチェック
+frontend URL は React SPA が解釈します。
 
-`crates/server/src/main.rs` で、以下の route が実装されています。
+```txt
+/                       /home へ redirect
+/home                   logged-in user home timeline
+/@:username             profile and user posts
+/@:username/:postId     post detail
+```
 
-- `GET /health`
+補足:
 
-現状は固定文字列 `ok` を返します。
+- `/home` は現状 `VITE_DEFAULT_USERNAME` の local actor を home timeline として表示します
+- `/@:username` は local actor の profile と投稿一覧を表示します
+- `/@:username/:postId` はその actor 文脈での単一投稿画面です
 
-## 2. 投稿 URL
+## Server
+
+server URL は外部公開される ActivityPub / WebFinger 用 URL です。
+実際の backend 実装は `/api` 配下にありますが、公開 URL は Hono が proxy して維持します。
+
+```txt
+/.well-known/webfinger  WebFinger
+/users/:username        ActivityPub actor JSON
+/users/:username/outbox ActivityPub outbox
+/posts/:postId          ActivityPub Note object
+```
+
+補足:
+
+- `/.well-known/webfinger` は Hono から `/api/.well-known/webfinger` へ proxy されます
+- `/users/:username` は Hono から `/api/users/:username` へ proxy されます
+- `/users/:username/outbox` は Hono から `/api/users/:username/outbox` へ proxy されます
+- `/posts/:postId` は ActivityPub 用 `Accept` header のときだけ Hono から `/api/posts/:postId` へ proxy されます
+
+## Backend API
+
+backend API は Rust server が直接提供する内部向け endpoint です。
+
+```txt
+/api/health
+/api/.well-known/webfinger
+/api/users/:username
+/api/users/:username/posts
+/api/users/:username/outbox
+/api/posts/:postId
+```
+
+content negotiation は次の通りです。
+
+- `GET /api/users/:username`
+  - `Accept: application/activity+json` なら Actor JSON
+  - それ以外は frontend 向け JSON
+- `GET /api/posts/:postId`
+  - `Accept: application/activity+json` なら Note object
+  - それ以外は frontend 向け JSON
+
+## 投稿 URL
 
 `crates/domain/src/lib.rs` の `Post::new(new_post, public_base_url)` で、投稿 URL は次の形で生成されます。
 
@@ -34,97 +83,55 @@ https://example.invalid/posts/01974f87-2f40-7d11-a5aa-8a9d6d9d9a3b
 補足:
 
 - `post_id` は `Uuid::now_v7()` で生成されます
-- `public_base_url` の末尾 `/` は `trim_end_matches('/')` で除去されます
+- `public_base_url` の末尾 `/` は除去されます
 - そのため `https://example.invalid` と `https://example.invalid/` は同じ結果になります
+
+## Actor / Outbox URL
+
+local actor の canonical URL は次の形を前提にしています。
+
+```txt
+actor_url   = {public_base_url}/users/{username}
+outbox_url  = {public_base_url}/users/{username}/outbox
+inbox_url   = {public_base_url}/users/{username}/inbox
+```
+
+現状のフェーズ2実装で実際に公開しているのは次です。
+
+- `actor_url`
+- `outbox_url`
+
+`inbox_url` は field として存在しますが、endpoint 自体は未実装です。
+
+## WebFinger
+
+WebFinger は次の resource を受け付けます。
+
+```txt
+acct:{username}@{host}
+```
 
 例:
 
 ```txt
-public_base_url = https://example.invalid
--> https://example.invalid/posts/{post_id}
-
-public_base_url = https://example.invalid/
--> https://example.invalid/posts/{post_id}
+acct:alice@example.invalid
 ```
 
-## 型として存在するが未確定の URL
+成功時は actor URL を `self` link として返します。
 
-## 1. actor URL
+## 現時点で未実装の URL
 
-`ActorProfile` には以下の field があります。
+以下は型や計画にはあるものの、まだ route としては実装されていません。
 
-- `actor_url: Url`
-- `inbox_url: Option<Url>`
-- `outbox_url: Option<Url>`
+- `/users/:username/inbox`
+- `/users/:username/followers`
+- `/users/:username/following`
+- media attachment URL
+- remote actor / remote object 用 URL
 
-ただし現時点では、これらをどのパターンで生成するかは実装されていません。  
-つまり、URL を保持する型はあるが、URL 規約そのものはまだ固定されていません。
+## 設計上のルール
 
-現時点で言えるのは以下だけです。
-
-- local actor も remote actor も `ActorProfile` を持つ
-- ActivityPub 変換では `actor_url` が actor の `id` に使われる
-
-## 2. inbox / outbox URL
-
-`ActorProfile` に `inbox_url`, `outbox_url` があるため、domain としては actor ごとに inbox/outbox を持てる前提です。
-
-ただし以下はまだ未確定です。
-
-- local actor の inbox を `/users/{username}/inbox` にするか
-- shared inbox を `/inbox` にするか
-- outbox を `/users/{username}/outbox` にするか
-
-これらは `server` の route 実装時に確定します。
-
-## 現時点で未確定なもの
-
-以下はドキュメント上では候補が出ていますが、コードとしてはまだ確定していません。
-
-- actor ページ URL
-- WebFinger endpoint
-- inbox endpoint
-- outbox endpoint
-- followers endpoint
-- following endpoint
-- media URL
-
-たとえば `tmp/docs/implementation-plan.md` では次が候補として挙がっています。
-
-- `GET /.well-known/webfinger`
-- `GET /users/:name`
-- `GET /users/:name/outbox`
-- `POST /users/:name/inbox`
-- `GET /posts/:id`
-
-ただし、これは現時点では実装計画であり、まだ仕様確定とはみなしません。
-
-## 現状の暫定ルール
-
-今の実装だけから安全に言える暫定ルールは次の通りです。
-
-- サーバーの base URL は `https://example.invalid` のような origin 単位で与える
-- 投稿 URL は常に `/posts/{uuidv7}` 形式
-- actor 系 URL は field として存在するが、パス規約は未確定
-
-## 今後ここで固定すべき項目
-
-URL 仕様として次に固定するべきなのは以下です。
-
-1. local actor の canonical URL
-2. local actor の inbox / outbox URL
-3. WebFinger の `resource=acct:{username}@{host}` から引く actor URL
-4. shared inbox を持つかどうか
-5. media attachment URL
-
-現状の実装に一番近い候補は以下です。
-
-```txt
-GET  /health
-GET  /users/{username}
-GET  /users/{username}/outbox
-POST /users/{username}/inbox
-GET  /posts/{post_id}
-```
-
-ただし、`/users/` を最終採用するかはまだ未決定です。
+- browser が見る URL と ActivityPub 公開 URL は分ける
+- external に見せる ActivityPub URL は `/users/...` と `/posts/...` を使う
+- Rust server の内部実装は `/api/...` に置く
+- Hono が公開 URL と `/api/...` の橋渡しを担う

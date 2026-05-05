@@ -5,6 +5,14 @@ import type { ActorProfile, Post } from "./types";
 
 const defaultUsername = import.meta.env.VITE_DEFAULT_USERNAME ?? "alice";
 
+function profilePath(username: string): string {
+  return `/@${username}`;
+}
+
+function postPath(username: string, postId: string): string {
+  return `${profilePath(username)}/${postId}`;
+}
+
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat("ja-JP", {
     dateStyle: "medium",
@@ -43,7 +51,7 @@ function AppShell({
   );
 }
 
-function FeedCard({ post }: { post: Post }) {
+function FeedCard({ post, username }: { post: Post; username: string }) {
   const body = useMemo(() => ({ __html: post.content_html }), [post.content_html]);
 
   return (
@@ -55,7 +63,7 @@ function FeedCard({ post }: { post: Post }) {
       </div>
       <div className="post-body" dangerouslySetInnerHTML={body} />
       <div className="post-footer">
-        <Link to={`/posts/${post.id}`}>Open post</Link>
+        <Link to={postPath(username, post.id)}>Open post</Link>
         <span className="muted">{post.url}</span>
       </div>
     </article>
@@ -86,7 +94,7 @@ function Composer({ username, onCreated }: { username: string; onCreated: (post:
       onCreated(post);
       setContentSource("");
       setReplyTo("");
-      navigate(`/posts/${post.id}`);
+      navigate(postPath(username, post.id));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "failed to create post");
     } finally {
@@ -157,9 +165,19 @@ function Composer({ username, onCreated }: { username: string; onCreated: (post:
   );
 }
 
-function UserPage() {
-  const { handle } = useParams();
-  const username = handle?.startsWith("@") ? handle.slice(1) : (handle ?? defaultUsername);
+function normalizeHandle(handle: string | undefined): string {
+  return handle?.startsWith("@") ? handle.slice(1) : (handle ?? defaultUsername);
+}
+
+function TimelinePage({
+  username,
+  title,
+  subtitle,
+}: {
+  username: string;
+  title: string;
+  subtitle: string;
+}) {
   const [actor, setActor] = useState<ActorProfile | null>(null);
   const [posts, setPosts] = useState<Post[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
@@ -216,10 +234,7 @@ function UserPage() {
   }
 
   return (
-    <AppShell
-      title={`Timeline for @${username}`}
-      subtitle="Phase 1 UI: profile, timeline, and composer."
-    >
+    <AppShell title={title} subtitle={subtitle}>
       <section className="panel profile-panel">
         <div className="panel-header">
           <h2>Profile</h2>
@@ -272,7 +287,7 @@ function UserPage() {
           {posts.length === 0 ? (
             <p className="muted">No posts yet.</p>
           ) : (
-            posts.map((post) => <FeedCard key={post.id} post={post} />)
+            posts.map((post) => <FeedCard key={post.id} post={post} username={username} />)
           )}
         </div>
 
@@ -288,8 +303,32 @@ function UserPage() {
   );
 }
 
+function HomePage() {
+  return (
+    <TimelinePage
+      username={defaultUsername}
+      title="Home timeline"
+      subtitle="Posts visible from the logged-in local user."
+    />
+  );
+}
+
+function UserPage() {
+  const { handle } = useParams();
+  const username = normalizeHandle(handle);
+
+  return (
+    <TimelinePage
+      username={username}
+      title={`Profile for @${username}`}
+      subtitle="Profile and posts for a local actor."
+    />
+  );
+}
+
 function PostPage() {
-  const { postId = "" } = useParams();
+  const { handle, postId = "" } = useParams();
+  const username = normalizeHandle(handle);
   const [post, setPost] = useState<Post | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -321,7 +360,7 @@ function PostPage() {
   return (
     <AppShell
       title="Single post view"
-      subtitle="Useful for phase 1 verification and later federation."
+      subtitle={`Post detail for @${username}.`}
     >
       <section className="panel wide-panel">
         <div className="panel-header">
@@ -332,7 +371,7 @@ function PostPage() {
         {error ? (
           <p className="error">{error}</p>
         ) : post ? (
-          <FeedCard post={post} />
+          <FeedCard post={post} username={username} />
         ) : (
           <p className="muted">Loading post...</p>
         )}
@@ -344,9 +383,10 @@ function PostPage() {
 export function App() {
   return (
     <Routes>
-      <Route path="/" element={<Navigate replace to={`/@${defaultUsername}`} />} />
+      <Route path="/" element={<Navigate replace to="/home" />} />
+      <Route path="/home" element={<HomePage />} />
+      <Route path="/:handle/:postId" element={<PostPage />} />
       <Route path="/:handle" element={<UserPage />} />
-      <Route path="/posts/:postId" element={<PostPage />} />
     </Routes>
   );
 }
