@@ -19,7 +19,7 @@ pub struct NoteObject {
 pub fn actor_profile_to_object(actor: &ActorProfile) -> ActorObject {
     ActorObject {
         id: actor.actor_url.clone(),
-        preferred_username: actor.username.clone(),
+        preferred_username: actor.username.to_string(),
     }
 }
 

@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use kodamapub_domain::{
-    ActorId, ActorProfile, ContentFormat, LocalActor, Post, PostId, RemoteActor, Visibility,
+    ActorId, ActorProfile, ContentFormat, LocalActor, Post, PostId, RemoteActor, Summary,
+    Username, UsernameError, Visibility, TextValueError,
 };
 use sqlx::{migrate::Migrator, Row, SqlitePool};
 use thiserror::Error;
@@ -62,9 +63,9 @@ impl<'a> LocalActorRepository<'a> {
             "#,
         )
         .bind(actor.id().0)
-        .bind(&actor.profile.username)
-        .bind(&actor.profile.display_name)
-        .bind(&actor.profile.summary)
+        .bind(actor.profile.username.as_str())
+        .bind(actor.profile.display_name.as_str())
+        .bind(actor.profile.summary.as_ref().map(Summary::as_str))
         .bind(actor.profile.actor_url.as_str())
         .bind(opt_url_str(&actor.profile.inbox_url))
         .bind(opt_url_str(&actor.profile.outbox_url))
@@ -88,7 +89,7 @@ impl<'a> LocalActorRepository<'a> {
         Ok(())
     }
 
-    pub async fn find_by_username(&self, username: &str) -> Result<Option<LocalActor>, DbError> {
+    pub async fn find_by_username(&self, username: &Username) -> Result<Option<LocalActor>, DbError> {
         let row = sqlx::query(
             r#"
             select
@@ -106,7 +107,7 @@ impl<'a> LocalActorRepository<'a> {
             where a.username = $1
             "#,
         )
-        .bind(username)
+        .bind(username.as_str())
         .fetch_optional(self.pool)
         .await?;
 
@@ -137,9 +138,9 @@ impl<'a> RemoteActorRepository<'a> {
             "#,
         )
         .bind(actor.id().0)
-        .bind(&actor.profile.username)
-        .bind(&actor.profile.display_name)
-        .bind(&actor.profile.summary)
+        .bind(actor.profile.username.as_str())
+        .bind(actor.profile.display_name.as_str())
+        .bind(actor.profile.summary.as_ref().map(Summary::as_str))
         .bind(actor.profile.actor_url.as_str())
         .bind(opt_url_str(&actor.profile.inbox_url))
         .bind(opt_url_str(&actor.profile.outbox_url))
@@ -208,7 +209,7 @@ impl<'a> PostRepository<'a> {
         .bind(post.id.0)
         .bind(post.actor_id.0)
         .bind(post.url.as_str())
-        .bind(&post.content_source)
+        .bind(post.content_source.as_str())
         .bind(content_format_to_db(&post.content_format))
         .bind(&post.content_html)
         .bind(visibility_to_db(&post.visibility))
@@ -277,9 +278,19 @@ fn remote_actor_from_row(row: sqlx::sqlite::SqliteRow) -> Result<RemoteActor, Db
 fn actor_profile_from_columns(row: &sqlx::sqlite::SqliteRow) -> Result<ActorProfile, DbError> {
     Ok(ActorProfile {
         id: ActorId(row.try_get::<Uuid, _>("id")?),
-        username: row.try_get("username")?,
-        display_name: row.try_get("display_name")?,
-        summary: row.try_get("summary")?,
+        username: row
+            .try_get::<String, _>("username")?
+            .parse()
+            .map_err(DbError::InvalidUsername)?,
+        display_name: row
+            .try_get::<String, _>("display_name")?
+            .parse()
+            .map_err(DbError::InvalidTextValue)?,
+        summary: row
+            .try_get::<Option<String>, _>("summary")?
+            .map(|value| value.parse())
+            .transpose()
+            .map_err(DbError::InvalidTextValue)?,
         actor_url: parse_url(row.try_get("actor_url")?)?,
         inbox_url: parse_optional_url(row.try_get("inbox_url")?)?,
         outbox_url: parse_optional_url(row.try_get("outbox_url")?)?,
@@ -294,7 +305,10 @@ fn post_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Post, DbError> {
         id: PostId(row.try_get::<Uuid, _>("id")?),
         actor_id: ActorId(row.try_get::<Uuid, _>("actor_id")?),
         url: parse_url(row.try_get("url")?)?,
-        content_source: row.try_get("content_source")?,
+        content_source: row
+            .try_get::<String, _>("content_source")?
+            .parse()
+            .map_err(DbError::InvalidTextValue)?,
         content_format,
         content_html: row.try_get("content_html")?,
         visibility,
@@ -363,6 +377,10 @@ pub enum DbError {
     UnknownVisibility(String),
     #[error("unknown content format in database: {0}")]
     UnknownContentFormat(String),
+    #[error("invalid username in database: {0}")]
+    InvalidUsername(UsernameError),
+    #[error("invalid text value in database: {0}")]
+    InvalidTextValue(TextValueError),
 }
 
 #[cfg(test)]
@@ -394,9 +412,9 @@ mod tests {
     fn sample_local_actor() -> LocalActor {
         LocalActor {
             profile: ActorProfile::new(
-                "alice",
-                "Alice",
-                Some("local actor".to_string()),
+                "alice".parse().expect("username"),
+                "Alice".parse().expect("display name"),
+                Some("local actor".parse().expect("summary")),
                 Url::parse("https://example.invalid/users/alice").expect("actor url"),
                 Some(Url::parse("https://example.invalid/users/alice/inbox").expect("inbox url")),
                 Some(
@@ -440,7 +458,7 @@ mod tests {
 
         let found = db
             .local_actors()
-            .find_by_username("alice")
+            .find_by_username(&"alice".parse().expect("username"))
             .await
             .expect("find local actor")
             .expect("local actor exists");
@@ -461,12 +479,12 @@ mod tests {
         let post = Post::new(
             NewPost {
                 actor_id: actor.id(),
-                content_source: "hello from sqlite".to_string(),
+                content_source: "hello from sqlite".parse().expect("content source"),
                 content_format: ContentFormat::Plaintext,
                 visibility: Visibility::Public,
                 in_reply_to: None,
             },
-            "https://example.invalid",
+            &"https://example.invalid".parse().expect("public base url"),
         )
         .expect("create post");
 
