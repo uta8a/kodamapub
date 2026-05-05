@@ -1,3 +1,7 @@
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
+};
 use chrono::{DateTime, Utc};
 use kodamapub_domain::{
     ActorId, ActorProfile, ContentFormat, DeliveryJob, DeliveryJobId, DeliveryKind, DeliveryState,
@@ -55,6 +59,14 @@ impl Database {
         InboxDedupRepository { pool: &self.pool }
     }
 
+    pub fn local_actor_credentials(&self) -> LocalActorCredentialRepository<'_> {
+        LocalActorCredentialRepository { pool: &self.pool }
+    }
+
+    pub fn sessions(&self) -> SessionRepository<'_> {
+        SessionRepository { pool: &self.pool }
+    }
+
     pub fn posts(&self) -> PostRepository<'_> {
         PostRepository { pool: &self.pool }
     }
@@ -95,6 +107,59 @@ impl<'a> LocalActorRepository<'a> {
         .bind(actor.id().0)
         .bind(&actor.public_key_pem)
         .bind(&actor.private_key_pem)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn create_with_password(
+        &self,
+        actor: &LocalActor,
+        password_hash: &str,
+    ) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            r#"
+            insert into actors (
+                id, username, display_name, summary, actor_url, inbox_url, outbox_url, created_at
+            ) values ($1, $2, $3, $4, $5, $6, $7, current_timestamp)
+            "#,
+        )
+        .bind(actor.id().0)
+        .bind(actor.profile.username.as_str())
+        .bind(actor.profile.display_name.as_str())
+        .bind(actor.profile.summary.as_ref().map(Summary::as_str))
+        .bind(actor.profile.actor_url.as_str())
+        .bind(opt_url_str(&actor.profile.inbox_url))
+        .bind(opt_url_str(&actor.profile.outbox_url))
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            insert into local_actor_secrets (
+                actor_id, public_key_pem, private_key_pem
+            ) values ($1, $2, $3)
+            "#,
+        )
+        .bind(actor.id().0)
+        .bind(&actor.public_key_pem)
+        .bind(&actor.private_key_pem)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            insert into local_actor_credentials (
+                actor_id, password_hash
+            ) values ($1, $2)
+            "#,
+        )
+        .bind(actor.id().0)
+        .bind(password_hash)
         .execute(&mut *tx)
         .await?;
 
@@ -157,6 +222,14 @@ impl<'a> LocalActorRepository<'a> {
 }
 
 pub struct RemoteActorRepository<'a> {
+    pool: &'a SqlitePool,
+}
+
+pub struct LocalActorCredentialRepository<'a> {
+    pool: &'a SqlitePool,
+}
+
+pub struct SessionRepository<'a> {
     pool: &'a SqlitePool,
 }
 
@@ -230,6 +303,117 @@ impl<'a> RemoteActorRepository<'a> {
         .await?;
 
         row.map(remote_actor_from_row).transpose()
+    }
+}
+
+impl<'a> LocalActorCredentialRepository<'a> {
+    pub async fn set_password_hash(
+        &self,
+        actor_id: ActorId,
+        password_hash: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            insert into local_actor_credentials (actor_id, password_hash)
+            values ($1, $2)
+            on conflict (actor_id) do update set
+                password_hash = excluded.password_hash
+            "#,
+        )
+        .bind(actor_id.0)
+        .bind(password_hash)
+        .execute(self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn find_password_hash_by_username(
+        &self,
+        username: &Username,
+    ) -> Result<Option<(ActorId, String)>, DbError> {
+        let row = sqlx::query(
+            r#"
+            select a.id, c.password_hash
+            from actors a
+            join local_actor_credentials c on c.actor_id = a.id
+            where a.username = $1
+            "#,
+        )
+        .bind(username.as_str())
+        .fetch_optional(self.pool)
+        .await?;
+
+        row.map(|row| {
+            Ok((
+                ActorId(row.try_get::<Uuid, _>("id")?),
+                row.try_get::<String, _>("password_hash")?,
+            ))
+        })
+        .transpose()
+    }
+}
+
+impl<'a> SessionRepository<'a> {
+    pub async fn create(
+        &self,
+        token: &str,
+        actor_id: ActorId,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            insert into login_sessions (token, actor_id, created_at, expires_at)
+            values ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(token)
+        .bind(actor_id.0)
+        .bind(Utc::now())
+        .bind(expires_at)
+        .execute(self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn find_actor_id(&self, token: &str) -> Result<Option<ActorId>, DbError> {
+        let row = sqlx::query(
+            r#"
+            select actor_id, expires_at
+            from login_sessions
+            where token = $1
+            "#,
+        )
+        .bind(token)
+        .fetch_optional(self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let expires_at: DateTime<Utc> = row.try_get("expires_at")?;
+        if expires_at <= Utc::now() {
+            self.delete(token).await?;
+            return Ok(None);
+        }
+
+        Ok(Some(ActorId(row.try_get::<Uuid, _>("actor_id")?)))
+    }
+
+    pub async fn delete(&self, token: &str) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            delete from login_sessions
+            where token = $1
+            "#,
+        )
+        .bind(token)
+        .execute(self.pool)
+        .await?;
+
+        Ok(())
     }
 }
 
@@ -978,6 +1162,21 @@ fn opt_url_str(url: &Option<Url>) -> Option<&str> {
     url.as_ref().map(Url::as_str)
 }
 
+pub fn hash_password(password: &str) -> Result<String, AuthError> {
+    let salt = SaltString::generate(&mut OsRng);
+    let hash = Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|error| AuthError::Hash(error.to_string()))?;
+    Ok(hash.to_string())
+}
+
+pub fn verify_password(password: &str, password_hash: &str) -> Result<bool, AuthError> {
+    let parsed = PasswordHash::new(password_hash).map_err(|error| AuthError::Hash(error.to_string()))?;
+    Ok(Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok())
+}
+
 #[derive(Debug, Error)]
 pub enum DbError {
     #[error(transparent)]
@@ -1000,6 +1199,12 @@ pub enum DbError {
     InvalidUsername(UsernameError),
     #[error("invalid text value in database: {0}")]
     InvalidTextValue(TextValueError),
+}
+
+#[derive(Debug, Error)]
+pub enum AuthError {
+    #[error("unable to hash password: {0}")]
+    Hash(String),
 }
 
 #[cfg(test)]

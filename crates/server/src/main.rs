@@ -1,13 +1,13 @@
 use std::{net::SocketAddr, sync::Arc};
 
+use chrono::{Duration as ChronoDuration, Utc};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
-    routing::get,
-    routing::post,
+    routing::{get, post},
 };
 use kodamapub_activitypub::{
     IncomingActivity, fetch_remote_actor, is_publicly_visible, local_actor_to_object,
@@ -22,6 +22,7 @@ use kodamapub_domain::{
 };
 use kodamapub_job::{JobError, RetryPolicy, enqueue_create_deliveries};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
@@ -31,6 +32,7 @@ struct AppState {
 }
 
 const MAX_INBOX_BODY_BYTES: usize = 1_048_576;
+const SESSION_COOKIE_NAME: &str = "kodamapub_session";
 
 #[derive(Debug, Deserialize)]
 struct CreatePostRequest {
@@ -38,6 +40,12 @@ struct CreatePostRequest {
     content_format: ContentFormat,
     visibility: Visibility,
     in_reply_to: Option<PostId>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginRequest {
+    username: Username,
+    password: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +95,8 @@ struct ServerConfig {
 #[derive(Debug)]
 enum ApiError {
     NotFound(&'static str),
+    Unauthorized(&'static str),
+    Forbidden(&'static str),
     #[allow(dead_code)]
     BadRequest(String),
     Internal(anyhow::Error),
@@ -113,6 +123,12 @@ impl From<JobError> for ApiError {
     }
 }
 
+impl From<kodamapub_db::AuthError> for ApiError {
+    fn from(value: kodamapub_db::AuthError) -> Self {
+        Self::Internal(value.into())
+    }
+}
+
 impl From<kodamapub_activitypub::ActivityPubError> for ApiError {
     fn from(value: kodamapub_activitypub::ActivityPubError) -> Self {
         Self::Internal(value.into())
@@ -129,6 +145,10 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         match self {
             ApiError::NotFound(message) => (StatusCode::NOT_FOUND, message).into_response(),
+            ApiError::Unauthorized(message) => {
+                (StatusCode::UNAUTHORIZED, message).into_response()
+            }
+            ApiError::Forbidden(message) => (StatusCode::FORBIDDEN, message).into_response(),
             ApiError::BadRequest(message) => (StatusCode::BAD_REQUEST, message).into_response(),
             ApiError::Internal(error) => {
                 tracing::error!(error = %error, "request failed");
@@ -145,6 +165,9 @@ async fn health() -> Json<HealthResponse> {
 fn build_app(state: Arc<AppState>, config: ServerConfig) -> Router {
     let api = Router::new()
         .route("/.well-known/webfinger", get(get_webfinger))
+        .route("/login", post(post_login))
+        .route("/logout", post(post_logout))
+        .route("/session", get(get_session))
         .route("/posts/{post_id}", get(get_post_activitypub))
         .route("/users/{username}", get(get_actor))
         .route("/users/{username}/outbox", get(get_outbox))
@@ -187,8 +210,14 @@ async fn list_user_posts(
 async fn create_user_post(
     State((state, _config)): State<(Arc<AppState>, ServerConfig)>,
     Path(path): Path<UsernamePath>,
+    headers: HeaderMap,
     Json(request): Json<CreatePostRequest>,
 ) -> Result<(StatusCode, Json<Post>), ApiError> {
+    let session_actor = require_session_actor(&state, &headers).await?;
+    if session_actor.profile.username != path.username {
+        return Err(ApiError::Forbidden("cannot post as another user"));
+    }
+
     let actor = state
         .db
         .local_actors()
@@ -345,6 +374,130 @@ async fn get_webfinger(
         .ok_or(ApiError::NotFound("local actor not found"))?;
 
     jrd_response(&webfinger_response(query.resource, actor.profile.actor_url))
+}
+
+async fn post_login(
+    State((state, _config)): State<(Arc<AppState>, ServerConfig)>,
+    Json(request): Json<LoginRequest>,
+) -> Result<Response, ApiError> {
+    let actor = state
+        .db
+        .local_actors()
+        .find_by_username(&request.username)
+        .await?
+        .ok_or(ApiError::Unauthorized("invalid credentials"))?;
+    let Some((_, password_hash)) = state
+        .db
+        .local_actor_credentials()
+        .find_password_hash_by_username(&request.username)
+        .await?
+    else {
+        return Err(ApiError::Unauthorized("invalid credentials"));
+    };
+
+    if !kodamapub_db::verify_password(&request.password, &password_hash)? {
+        return Err(ApiError::Unauthorized("invalid credentials"));
+    }
+
+    let token = Uuid::now_v7().to_string();
+    let expires_at = Utc::now() + ChronoDuration::days(30);
+    state
+        .db
+        .sessions()
+        .create(&token, actor.id(), expires_at)
+        .await?;
+
+    let secure = state.public_base_url.as_str().starts_with("https://");
+    session_response(
+        actor.profile,
+        Some(build_session_cookie(&token, expires_at, secure)?),
+    )
+}
+
+async fn get_session(
+    State((state, _config)): State<(Arc<AppState>, ServerConfig)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let actor = require_session_actor(&state, &headers).await?;
+    session_response(actor.profile, None)
+}
+
+async fn post_logout(
+    State((state, _config)): State<(Arc<AppState>, ServerConfig)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    if let Some(token) = session_token_from_headers(&headers) {
+        state.db.sessions().delete(&token).await?;
+    }
+
+    let mut response = Response::new(Body::empty());
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&clear_session_cookie(
+            state.public_base_url.as_str().starts_with("https://"),
+        ))
+            .map_err(|error| ApiError::BadRequest(error.to_string()))?,
+    );
+    Ok(response)
+}
+
+async fn require_session_actor(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<kodamapub_domain::LocalActor, ApiError> {
+    let token = session_token_from_headers(headers)
+        .ok_or(ApiError::Unauthorized("session is required"))?;
+    let Some(actor_id) = state.db.sessions().find_actor_id(&token).await? else {
+        return Err(ApiError::Unauthorized("session is required"));
+    };
+
+    state
+        .db
+        .local_actors()
+        .find_by_id(actor_id)
+        .await?
+        .ok_or(ApiError::Unauthorized("session is required"))
+}
+
+fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers.get(header::COOKIE).and_then(|value| value.to_str().ok()).and_then(|cookies| {
+        cookies
+            .split(';')
+            .map(str::trim)
+            .find_map(|cookie| cookie.strip_prefix(&format!("{SESSION_COOKIE_NAME}=")))
+            .map(str::to_string)
+    })
+}
+
+fn session_response(actor: kodamapub_domain::ActorProfile, cookie: Option<String>) -> Result<Response, ApiError> {
+    let mut response = Json(actor).into_response();
+    if let Some(cookie) = cookie {
+        response.headers_mut().insert(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&cookie)
+                .map_err(|error| ApiError::BadRequest(error.to_string()))?,
+        );
+    }
+    Ok(response)
+}
+
+fn build_session_cookie(
+    token: &str,
+    expires_at: chrono::DateTime<Utc>,
+    secure: bool,
+) -> Result<String, ApiError> {
+    let max_age = expires_at.signed_duration_since(Utc::now()).num_seconds().max(0);
+    let secure_flag = if secure { "; Secure" } else { "" };
+    Ok(format!(
+        "{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure_flag}"
+    ))
+}
+
+fn clear_session_cookie(secure: bool) -> String {
+    let secure_flag = if secure { "; Secure" } else { "" };
+    format!(
+        "{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure_flag}"
+    )
 }
 
 async fn post_inbox(

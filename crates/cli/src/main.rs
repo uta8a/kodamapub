@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use kodamapub_activitypub::{discover_remote_actor, generate_local_actor_keypair_pem};
-use kodamapub_db::Database;
+use kodamapub_db::{Database, hash_password};
 use kodamapub_domain::{
     ActorProfile, ContentFormat, ContentSource, DisplayName, LocalActor, NewPost, Post,
     PublicBaseUrl, Summary, Username, Visibility,
@@ -36,6 +36,16 @@ enum Command {
         display_name: DisplayName,
         #[arg(long)]
         summary: Option<Summary>,
+        #[arg(long)]
+        password: String,
+    },
+    SetPassword {
+        #[arg(long, env = "DATABASE_URL", default_value = "sqlite://kodamapub.db")]
+        database_url: String,
+        #[arg(long)]
+        username: Username,
+        #[arg(long)]
+        password: String,
     },
     SeedDemo {
         #[arg(long, env = "DATABASE_URL", default_value = "sqlite://kodamapub.db")]
@@ -48,6 +58,8 @@ enum Command {
         display_name: DisplayName,
         #[arg(long, default_value = "Seeded demo account")]
         summary: Summary,
+        #[arg(long, default_value = "password")]
+        password: String,
     },
     Follow {
         #[arg(long, env = "DATABASE_URL", default_value = "sqlite://kodamapub.db")]
@@ -90,12 +102,34 @@ async fn main() -> anyhow::Result<()> {
             username,
             display_name,
             summary,
+            password,
         } => {
             let db = Database::connect(&database_url).await?;
             db.migrate().await?;
             let actor = build_local_actor(public_base_url, username, display_name, summary)?;
-            db.local_actors().create(&actor).await?;
+            let password_hash = hash_password(&password)?;
+            db.local_actors()
+                .create_with_password(&actor, &password_hash)
+                .await?;
             println!("{}", actor.profile.actor_url);
+        }
+        Command::SetPassword {
+            database_url,
+            username,
+            password,
+        } => {
+            let db = Database::connect(&database_url).await?;
+            db.migrate().await?;
+            let actor = db
+                .local_actors()
+                .find_by_username(&username)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("local actor not found: {username}"))?;
+            let password_hash = hash_password(&password)?;
+            db.local_actor_credentials()
+                .set_password_hash(actor.id(), &password_hash)
+                .await?;
+            println!("updated password for {}", actor.profile.actor_url);
         }
         Command::SeedDemo {
             database_url,
@@ -103,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
             username,
             display_name,
             summary,
+            password,
         } => {
             let db = Database::connect(&database_url).await?;
             db.migrate().await?;
@@ -116,10 +151,18 @@ async fn main() -> anyhow::Result<()> {
                         display_name,
                         Some(summary),
                     )?;
-                    db.local_actors().create(&actor).await?;
+                    let password_hash = hash_password(&password)?;
+                    db.local_actors()
+                        .create_with_password(&actor, &password_hash)
+                        .await?;
                     actor
                 }
             };
+
+            let password_hash = hash_password(&password)?;
+            db.local_actor_credentials()
+                .set_password_hash(actor.id(), &password_hash)
+                .await?;
 
             let mut created = 0usize;
             for content in demo_posts() {
@@ -138,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             println!(
-                "seeded actor {} with {} posts",
+                "seeded actor {} with {} posts (password set)",
                 actor.profile.actor_url, created
             );
         }
