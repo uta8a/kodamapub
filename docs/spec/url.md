@@ -13,7 +13,8 @@ URL は次の 3 層に分けて扱います。
 frontend URL は React SPA が解釈します。
 
 ```txt
-/                       /home へ redirect
+/                       login 状態に応じて `/login` または `/home` へ redirect
+/login                  local actor login and switch account
 /home                   logged-in user home timeline
 /@:username             profile and user posts
 /@:username/:postId     post detail
@@ -21,7 +22,8 @@ frontend URL は React SPA が解釈します。
 
 補足:
 
-- `/home` は現状 `VITE_DEFAULT_USERNAME` の local actor を home timeline として表示します
+- `/login` は local actor の username を選ぶための画面です
+- `/home` は現在選択中の local actor の home timeline を表示します
 - `/@:username` は local actor の profile と投稿一覧を表示します
 - `/@:username/:postId` はその actor 文脈での単一投稿画面です
 

@@ -1,9 +1,26 @@
-import { type FormEvent, type ReactNode, useEffect, useMemo, useState } from "react";
+import {
+  type FormEvent,
+  type ReactNode,
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 import { Link, Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import { createPost, getActor, getPost, listPosts } from "./api";
 import type { ActorProfile, Post } from "./types";
 
 const defaultUsername = import.meta.env.VITE_DEFAULT_USERNAME ?? "alice";
+const sessionStorageKey = "kodamapub.active-username";
+
+type SessionContextValue = {
+  activeUsername: string | null;
+  setActiveUsername: (username: string | null) => void;
+  signOut: () => void;
+};
+
+const SessionContext = createContext<SessionContextValue | null>(null);
 
 function profilePath(username: string): string {
   return `/@${username}`;
@@ -20,6 +37,44 @@ function formatDate(value: string): string {
   }).format(new Date(value));
 }
 
+function useSession() {
+  const value = useContext(SessionContext);
+  if (!value) {
+    throw new Error("SessionContext is not available");
+  }
+
+  return value;
+}
+
+function SessionProvider({ children }: { children: ReactNode }) {
+  const [activeUsername, setActiveUsernameState] = useState<string | null>(() => {
+    const stored = window.localStorage.getItem(sessionStorageKey);
+    const trimmed = stored?.trim();
+    return trimmed ? trimmed : null;
+  });
+
+  useEffect(() => {
+    if (activeUsername) {
+      window.localStorage.setItem(sessionStorageKey, activeUsername);
+    } else {
+      window.localStorage.removeItem(sessionStorageKey);
+    }
+  }, [activeUsername]);
+
+  const value: SessionContextValue = {
+    activeUsername,
+    setActiveUsername(username) {
+      const trimmed = username?.trim();
+      setActiveUsernameState(trimmed ? trimmed : null);
+    },
+    signOut() {
+      setActiveUsernameState(null);
+    },
+  };
+
+  return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
+}
+
 function AppShell({
   title,
   subtitle,
@@ -29,10 +84,13 @@ function AppShell({
   subtitle: string;
   children: ReactNode;
 }) {
+  const { activeUsername, signOut } = useSession();
+  const homeLink = activeUsername ? "/home" : "/login";
+
   return (
     <div className="app-shell">
       <header className="topbar">
-        <Link className="brand" to={`/@${defaultUsername}`}>
+        <Link className="brand" to={homeLink}>
           <span className="brand-mark">k</span>
           <span>
             <strong>kodamapub</strong>
@@ -43,6 +101,27 @@ function AppShell({
         <div className="topbar-copy">
           <p>{title}</p>
           <span>{subtitle}</span>
+        </div>
+
+        <div className="topbar-actions">
+          {activeUsername ? (
+            <>
+              <div className="session-pill">
+                <span>Signed in</span>
+                <strong>@{activeUsername}</strong>
+              </div>
+              <Link className="secondary-button" to="/login">
+                Switch
+              </Link>
+              <button className="secondary-button" type="button" onClick={signOut}>
+                Sign out
+              </button>
+            </>
+          ) : (
+            <Link className="secondary-button" to="/login">
+              Sign in
+            </Link>
+          )}
         </div>
       </header>
 
@@ -166,17 +245,19 @@ function Composer({ username, onCreated }: { username: string; onCreated: (post:
 }
 
 function normalizeHandle(handle: string | undefined): string {
-  return handle?.startsWith("@") ? handle.slice(1) : (handle ?? defaultUsername);
+  return handle?.startsWith("@") ? handle.slice(1).trim() : handle?.trim() ?? "";
 }
 
 function TimelinePage({
   username,
   title,
   subtitle,
+  composerUsername,
 }: {
   username: string;
   title: string;
   subtitle: string;
+  composerUsername?: string;
 }) {
   const [actor, setActor] = useState<ActorProfile | null>(null);
   const [posts, setPosts] = useState<Post[]>([]);
@@ -270,12 +351,14 @@ function TimelinePage({
         )}
       </section>
 
-      <Composer
-        username={username}
-        onCreated={(post) => {
-          setPosts((current) => [post, ...current]);
-        }}
-      />
+      {composerUsername ? (
+        <Composer
+          username={composerUsername}
+          onCreated={(post) => {
+            setPosts((current) => [post, ...current]);
+          }}
+        />
+      ) : null}
 
       <section className="panel feed-panel">
         <div className="panel-header">
@@ -304,11 +387,18 @@ function TimelinePage({
 }
 
 function HomePage() {
+  const { activeUsername } = useSession();
+
+  if (!activeUsername) {
+    return <Navigate replace to="/login" />;
+  }
+
   return (
     <TimelinePage
-      username={defaultUsername}
+      username={activeUsername}
       title="Home timeline"
-      subtitle="Posts visible from the logged-in local user."
+      subtitle={`Posts visible from @${activeUsername}.`}
+      composerUsername={activeUsername}
     />
   );
 }
@@ -316,6 +406,10 @@ function HomePage() {
 function UserPage() {
   const { handle } = useParams();
   const username = normalizeHandle(handle);
+
+  if (!username) {
+    return <Navigate replace to="/login" />;
+  }
 
   return (
     <TimelinePage
@@ -380,13 +474,136 @@ function PostPage() {
   );
 }
 
+function LoginPage() {
+  const navigate = useNavigate();
+  const { activeUsername, setActiveUsername } = useSession();
+  const [username, setUsername] = useState(activeUsername ?? defaultUsername);
+  const [isChecking, setIsChecking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const normalized = normalizeHandle(username);
+    if (!normalized) {
+      setError("username is required");
+      return;
+    }
+
+    setIsChecking(true);
+    setError(null);
+
+    try {
+      await getActor(normalized);
+      setActiveUsername(normalized);
+      navigate("/home");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "failed to sign in");
+    } finally {
+      setIsChecking(false);
+    }
+  }
+
+  return (
+    <AppShell
+      title="Sign in"
+      subtitle="Choose the local actor you want to post as. No password is checked."
+    >
+      <section className="panel login-panel">
+        <div className="panel-header">
+          <h2>Login</h2>
+          <span>{activeUsername ? `current: @${activeUsername}` : "no active account"}</span>
+        </div>
+
+        <form className="login-form" onSubmit={submit}>
+          <label>
+            <span>Local username</span>
+            <input
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+              placeholder={defaultUsername}
+              autoComplete="username"
+              spellCheck={false}
+            />
+          </label>
+
+          <button type="submit" disabled={isChecking}>
+            {isChecking ? "Checking..." : "Continue"}
+          </button>
+
+          {error ? <p className="error">{error}</p> : null}
+        </form>
+      </section>
+
+      <section className="panel login-aside">
+        <div className="panel-header">
+          <h2>What this does</h2>
+          <span>local session only</span>
+        </div>
+
+        <p className="summary">
+          This screen only selects the local actor that the web app uses for posting. It does not
+          authenticate against a password store.
+        </p>
+
+        <ul className="feature-list">
+          <li>Validate the username against the server before saving it.</li>
+          <li>Keep the selection in browser storage so the session survives reloads.</li>
+          <li>Use the selected actor on the home timeline composer.</li>
+        </ul>
+
+        <div className="login-note">
+          <span>Suggested account</span>
+          <strong>@{defaultUsername}</strong>
+        </div>
+      </section>
+    </AppShell>
+  );
+}
+
+function NotFoundPage() {
+  return (
+    <AppShell title="Page not found" subtitle="The requested screen does not exist.">
+      <section className="panel wide-panel">
+        <div className="panel-header">
+          <h2>404</h2>
+          <span>route missing</span>
+        </div>
+
+        <h1 className="hero-title">That page is not here.</h1>
+        <p className="summary">
+          Use the home timeline, open a profile, or sign in with a local actor username.
+        </p>
+
+        <div className="button-row">
+          <Link className="secondary-button" to="/home">
+            Home
+          </Link>
+          <Link className="secondary-button" to="/login">
+            Sign in
+          </Link>
+        </div>
+      </section>
+    </AppShell>
+  );
+}
+
+function RootRedirect() {
+  const { activeUsername } = useSession();
+
+  return <Navigate replace to={activeUsername ? "/home" : "/login"} />;
+}
+
 export function App() {
   return (
-    <Routes>
-      <Route path="/" element={<Navigate replace to="/home" />} />
-      <Route path="/home" element={<HomePage />} />
-      <Route path="/:handle/:postId" element={<PostPage />} />
-      <Route path="/:handle" element={<UserPage />} />
-    </Routes>
+    <SessionProvider>
+      <Routes>
+        <Route path="/" element={<RootRedirect />} />
+        <Route path="/login" element={<LoginPage />} />
+        <Route path="/home" element={<HomePage />} />
+        <Route path="/:handle/:postId" element={<PostPage />} />
+        <Route path="/:handle" element={<UserPage />} />
+        <Route path="*" element={<NotFoundPage />} />
+      </Routes>
+    </SessionProvider>
   );
 }

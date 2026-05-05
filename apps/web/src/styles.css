@@ -1,14 +1,15 @@
 :root {
   color-scheme: light;
-  --bg: #f5efe6;
-  --bg-accent: #ede4d8;
-  --panel: rgba(255, 252, 247, 0.88);
-  --panel-border: rgba(59, 46, 30, 0.12);
-  --text: #20160f;
-  --muted: #705f50;
-  --accent: #8a4b2f;
-  --accent-strong: #4e240f;
-  --shadow: 0 24px 60px rgba(55, 31, 12, 0.12);
+  --bg: #f6efe3;
+  --bg-accent: #eadcc9;
+  --panel: rgba(255, 252, 245, 0.9);
+  --panel-border: rgba(66, 47, 29, 0.12);
+  --text: #241910;
+  --muted: #725f4f;
+  --accent: #8d4c2d;
+  --accent-strong: #522815;
+  --accent-soft: #e0c3b0;
+  --shadow: 0 24px 60px rgba(68, 38, 14, 0.12);
   --radius-xl: 28px;
   --radius-lg: 20px;
   --radius-md: 14px;
@@ -29,16 +30,16 @@ body {
   margin: 0;
   color: var(--text);
   background:
-    radial-gradient(circle at top left, rgba(218, 160, 126, 0.26), transparent 34%),
-    radial-gradient(circle at top right, rgba(116, 83, 49, 0.14), transparent 38%),
-    linear-gradient(180deg, var(--bg) 0%, #fffaf3 100%);
+    radial-gradient(circle at top left, rgba(209, 149, 108, 0.28), transparent 33%),
+    radial-gradient(circle at top right, rgba(101, 72, 43, 0.14), transparent 36%),
+    linear-gradient(180deg, var(--bg) 0%, #fffaf4 100%);
   font-family:
-    ui-sans-serif,
-    system-ui,
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
+    "Noto Sans JP",
+    "Hiragino Kaku Gothic ProN",
+    "Hiragino Sans",
+    "Yu Gothic",
     sans-serif;
+  overflow-x: hidden;
 }
 
 a {
@@ -67,6 +68,7 @@ select {
   align-items: flex-end;
   padding: 18px 20px 26px;
   margin-bottom: 22px;
+  flex-wrap: wrap;
 }
 
 .brand {
@@ -106,18 +108,49 @@ select {
 
 .topbar-copy {
   text-align: right;
+  flex: 1 1 240px;
 }
 
 .topbar-copy p {
   margin: 0;
   font-family: Georgia, "Times New Roman", serif;
-  font-size: clamp(1.6rem, 3vw, 3rem);
+  font-size: clamp(1.65rem, 3vw, 3rem);
   letter-spacing: -0.03em;
 }
 
 .topbar-copy span {
   display: block;
   margin-top: 8px;
+}
+
+.topbar-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.session-pill {
+  display: grid;
+  gap: 2px;
+  padding: 10px 14px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.76);
+  border: 1px solid rgba(66, 47, 29, 0.1);
+  box-shadow: 0 10px 30px rgba(68, 38, 14, 0.08);
+}
+
+.session-pill span {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+}
+
+.session-pill strong {
+  font-size: 0.92rem;
+  letter-spacing: 0.01em;
 }
 
 .page-grid {
@@ -133,6 +166,7 @@ select {
   backdrop-filter: blur(16px);
   box-shadow: var(--shadow);
   padding: 20px;
+  animation: rise 520ms ease both;
 }
 
 .wide-panel,
@@ -145,6 +179,14 @@ select {
   font-family: Georgia, "Times New Roman", serif;
   font-size: clamp(2rem, 4vw, 3.6rem);
   letter-spacing: -0.04em;
+}
+
+.hero-title {
+  margin: 10px 0 14px;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: clamp(2rem, 5vw, 4.2rem);
+  line-height: 1.02;
+  letter-spacing: -0.05em;
 }
 
 .handle {
@@ -172,6 +214,11 @@ select {
   text-transform: uppercase;
   letter-spacing: 0.14em;
   color: var(--accent-strong);
+}
+
+.profile-grid,
+.feature-list {
+  list-style: none;
 }
 
 .profile-grid {
@@ -206,7 +253,8 @@ select {
   gap: 14px;
 }
 
-.composer label {
+.composer label,
+.login-form label {
   display: grid;
   gap: 8px;
   font-size: 0.92rem;
@@ -215,7 +263,8 @@ select {
 
 .composer textarea,
 .composer input,
-.composer select {
+.composer select,
+.login-form input {
   width: 100%;
   border: 1px solid rgba(59, 46, 30, 0.16);
   border-radius: var(--radius-md);
@@ -235,8 +284,9 @@ select {
   gap: 12px;
 }
 
-.composer button {
-  justify-self: start;
+.composer button,
+.login-form button,
+.secondary-button {
   border: 0;
   border-radius: 999px;
   padding: 12px 18px;
@@ -246,18 +296,34 @@ select {
   cursor: pointer;
   transition:
     transform 120ms ease,
-    filter 120ms ease;
+    filter 120ms ease,
+    opacity 120ms ease;
+  text-decoration: none;
 }
 
-.composer button:hover {
+.composer button,
+.login-form button {
+  justify-self: start;
+}
+
+.composer button:hover,
+.login-form button:hover,
+.secondary-button:hover {
   transform: translateY(-1px);
   filter: brightness(1.05);
 }
 
-.composer button:disabled {
+.composer button:disabled,
+.login-form button:disabled {
   cursor: progress;
   opacity: 0.75;
   transform: none;
+}
+
+.secondary-button {
+  background: rgba(255, 255, 255, 0.84);
+  color: var(--accent-strong);
+  border: 1px solid rgba(66, 47, 29, 0.16);
 }
 
 .feed-actions {
@@ -322,6 +388,79 @@ select {
   font-weight: 600;
 }
 
+.login-panel,
+.login-aside {
+  min-height: 100%;
+}
+
+.login-form {
+  display: grid;
+  gap: 14px;
+}
+
+.login-note {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+  margin-top: 18px;
+  padding: 14px 16px;
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(59, 46, 30, 0.08);
+}
+
+.login-note span {
+  color: var(--muted);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+.feature-list {
+  margin: 18px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.feature-list li {
+  position: relative;
+  padding: 14px 14px 14px 20px;
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.68);
+  border: 1px solid rgba(59, 46, 30, 0.08);
+}
+
+.feature-list li::before {
+  content: "";
+  position: absolute;
+  top: 18px;
+  left: 10px;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 @media (max-width: 920px) {
   .page-grid {
     grid-template-columns: 1fr;
@@ -339,5 +478,36 @@ select {
   .profile-grid,
   .composer-row {
     grid-template-columns: 1fr;
+  }
+
+  .topbar-actions,
+  .login-note {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .topbar-actions {
+    justify-content: flex-start;
+  }
+
+  .session-pill {
+    width: 100%;
+  }
+
+  .secondary-button,
+  .composer button,
+  .login-form button {
+    width: 100%;
+    justify-content: center;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .panel,
+  .composer button,
+  .login-form button,
+  .secondary-button {
+    animation: none;
+    transition: none;
   }
 }
