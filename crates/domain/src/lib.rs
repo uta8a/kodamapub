@@ -49,6 +49,16 @@ impl TryFrom<String> for PostId {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct DeliveryJobId(pub Uuid);
+
+impl DeliveryJobId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Visibility {
     Public,
@@ -61,6 +71,27 @@ pub enum Visibility {
 pub enum ContentFormat {
     Plaintext,
     Markdown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FollowState {
+    Pending,
+    Active,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DeliveryState {
+    Pending,
+    Processing,
+    Delivered,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DeliveryKind {
+    Follow,
+    Create,
 }
 
 fn validate_nonempty_string(
@@ -391,6 +422,31 @@ impl RemoteActor {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FollowRelation {
+    pub local_actor_id: ActorId,
+    pub remote_actor_id: ActorId,
+    pub remote_actor_url: Url,
+    pub state: FollowState,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl FollowRelation {
+    pub fn new(local_actor_id: ActorId, remote_actor: &RemoteActor) -> Self {
+        let now = Utc::now();
+
+        Self {
+            local_actor_id,
+            remote_actor_id: remote_actor.id(),
+            remote_actor_url: remote_actor.profile.actor_url.clone(),
+            state: FollowState::Pending,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NewPost {
     pub actor_id: ActorId,
     pub content_source: ContentSource,
@@ -431,6 +487,49 @@ impl Post {
             in_reply_to: new_post.in_reply_to,
             created_at: Utc::now(),
         })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeliveryJob {
+    pub id: DeliveryJobId,
+    pub local_actor_id: ActorId,
+    pub target_inbox_url: Url,
+    pub kind: DeliveryKind,
+    pub payload: String,
+    pub state: DeliveryState,
+    pub attempts: u32,
+    pub max_attempts: u32,
+    pub next_attempt_at: DateTime<Utc>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub delivered_at: Option<DateTime<Utc>>,
+}
+
+impl DeliveryJob {
+    pub fn new(
+        local_actor_id: ActorId,
+        target_inbox_url: Url,
+        kind: DeliveryKind,
+        payload: String,
+        max_attempts: u32,
+    ) -> Self {
+        let now = Utc::now();
+
+        Self {
+            id: DeliveryJobId::new(),
+            local_actor_id,
+            target_inbox_url,
+            kind,
+            payload,
+            state: DeliveryState::Pending,
+            attempts: 0,
+            max_attempts,
+            next_attempt_at: now,
+            last_error: None,
+            created_at: now,
+            delivered_at: None,
+        }
     }
 }
 

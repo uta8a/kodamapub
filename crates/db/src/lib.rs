@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use kodamapub_domain::{
-    ActorId, ActorProfile, ContentFormat, LocalActor, Post, PostId, RemoteActor, Summary,
-    TextValueError, Username, UsernameError, Visibility,
+    ActorId, ActorProfile, ContentFormat, DeliveryJob, DeliveryJobId, DeliveryKind, DeliveryState,
+    FollowRelation, FollowState, LocalActor, Post, PostId, RemoteActor, Summary, TextValueError,
+    Username, UsernameError, Visibility,
 };
 use sqlx::{Row, SqlitePool, migrate::Migrator};
 use thiserror::Error;
@@ -40,6 +41,14 @@ impl Database {
 
     pub fn remote_actors(&self) -> RemoteActorRepository<'_> {
         RemoteActorRepository { pool: &self.pool }
+    }
+
+    pub fn follows(&self) -> FollowRepository<'_> {
+        FollowRepository { pool: &self.pool }
+    }
+
+    pub fn delivery_jobs(&self) -> DeliveryJobRepository<'_> {
+        DeliveryJobRepository { pool: &self.pool }
     }
 
     pub fn posts(&self) -> PostRepository<'_> {
@@ -221,6 +230,14 @@ impl<'a> RemoteActorRepository<'a> {
 }
 
 pub struct PostRepository<'a> {
+    pool: &'a SqlitePool,
+}
+
+pub struct FollowRepository<'a> {
+    pool: &'a SqlitePool,
+}
+
+pub struct DeliveryJobRepository<'a> {
     pool: &'a SqlitePool,
 }
 
@@ -426,6 +443,270 @@ impl<'a> PostRepository<'a> {
     }
 }
 
+impl<'a> FollowRepository<'a> {
+    pub async fn upsert(&self, follow: &FollowRelation) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            insert into follows (
+                local_actor_id, remote_actor_id, remote_actor_url, state, created_at, updated_at
+            ) values ($1, $2, $3, $4, $5, $6)
+            on conflict (local_actor_id, remote_actor_id) do update set
+                remote_actor_url = excluded.remote_actor_url,
+                state = excluded.state,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(follow.local_actor_id.0)
+        .bind(follow.remote_actor_id.0)
+        .bind(follow.remote_actor_url.as_str())
+        .bind(follow_state_to_db(&follow.state))
+        .bind(follow.created_at)
+        .bind(follow.updated_at)
+        .execute(self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn find(
+        &self,
+        local_actor_id: ActorId,
+        remote_actor_id: ActorId,
+    ) -> Result<Option<FollowRelation>, DbError> {
+        let row = sqlx::query(
+            r#"
+            select
+                local_actor_id, remote_actor_id, remote_actor_url, state, created_at, updated_at
+            from follows
+            where local_actor_id = $1 and remote_actor_id = $2
+            "#,
+        )
+        .bind(local_actor_id.0)
+        .bind(remote_actor_id.0)
+        .fetch_optional(self.pool)
+        .await?;
+
+        row.map(follow_from_row).transpose()
+    }
+
+    pub async fn set_state(
+        &self,
+        local_actor_id: ActorId,
+        remote_actor_id: ActorId,
+        state: FollowState,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            update follows
+            set state = $3, updated_at = $4
+            where local_actor_id = $1 and remote_actor_id = $2
+            "#,
+        )
+        .bind(local_actor_id.0)
+        .bind(remote_actor_id.0)
+        .bind(follow_state_to_db(&state))
+        .bind(Utc::now())
+        .execute(self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn list_active_remote_actors(
+        &self,
+        local_actor_id: ActorId,
+    ) -> Result<Vec<RemoteActor>, DbError> {
+        let rows = sqlx::query(
+            r#"
+            select
+                a.id,
+                a.username,
+                a.display_name,
+                a.summary,
+                a.actor_url,
+                a.inbox_url,
+                a.outbox_url,
+                s.public_key_pem,
+                s.fetched_at
+            from follows f
+            join actors a on a.id = f.remote_actor_id
+            join remote_actor_state s on s.actor_id = a.id
+            where f.local_actor_id = $1
+              and f.state = 'active'
+            order by f.created_at asc
+            "#,
+        )
+        .bind(local_actor_id.0)
+        .fetch_all(self.pool)
+        .await?;
+
+        rows.into_iter().map(remote_actor_from_row).collect()
+    }
+}
+
+impl<'a> DeliveryJobRepository<'a> {
+    pub async fn create(&self, job: &DeliveryJob) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            insert into delivery_jobs (
+                id, local_actor_id, target_inbox_url, kind, payload, state, attempts,
+                max_attempts, next_attempt_at, last_error, created_at, delivered_at
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            "#,
+        )
+        .bind(job.id.0)
+        .bind(job.local_actor_id.0)
+        .bind(job.target_inbox_url.as_str())
+        .bind(delivery_kind_to_db(&job.kind))
+        .bind(&job.payload)
+        .bind(delivery_state_to_db(&job.state))
+        .bind(job.attempts as i64)
+        .bind(job.max_attempts as i64)
+        .bind(job.next_attempt_at)
+        .bind(&job.last_error)
+        .bind(job.created_at)
+        .bind(job.delivered_at)
+        .execute(self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn list_due(
+        &self,
+        now: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<DeliveryJob>, DbError> {
+        let rows = sqlx::query(
+            r#"
+            select
+                id, local_actor_id, target_inbox_url, kind, payload, state, attempts,
+                max_attempts, next_attempt_at, last_error, created_at, delivered_at
+            from delivery_jobs
+            where state = 'pending'
+              and next_attempt_at <= $1
+            order by next_attempt_at asc, created_at asc
+            limit $2
+            "#,
+        )
+        .bind(now)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await?;
+
+        rows.into_iter().map(delivery_job_from_row).collect()
+    }
+
+    pub async fn find(&self, id: DeliveryJobId) -> Result<Option<DeliveryJob>, DbError> {
+        let row = sqlx::query(
+            r#"
+            select
+                id, local_actor_id, target_inbox_url, kind, payload, state, attempts,
+                max_attempts, next_attempt_at, last_error, created_at, delivered_at
+            from delivery_jobs
+            where id = $1
+            "#,
+        )
+        .bind(id.0)
+        .fetch_optional(self.pool)
+        .await?;
+
+        row.map(delivery_job_from_row).transpose()
+    }
+
+    pub async fn mark_processing(&self, id: DeliveryJobId) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            update delivery_jobs
+            set state = 'processing'
+            where id = $1
+            "#,
+        )
+        .bind(id.0)
+        .execute(self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn mark_delivered(&self, id: DeliveryJobId) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            update delivery_jobs
+            set state = 'delivered', delivered_at = $2, last_error = null
+            where id = $1
+            "#,
+        )
+        .bind(id.0)
+        .bind(Utc::now())
+        .execute(self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn reschedule(
+        &self,
+        id: DeliveryJobId,
+        attempts: u32,
+        next_attempt_at: DateTime<Utc>,
+        last_error: String,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            update delivery_jobs
+            set state = 'pending', attempts = $2, next_attempt_at = $3, last_error = $4
+            where id = $1
+            "#,
+        )
+        .bind(id.0)
+        .bind(attempts as i64)
+        .bind(next_attempt_at)
+        .bind(last_error)
+        .execute(self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn mark_failed(
+        &self,
+        id: DeliveryJobId,
+        attempts: u32,
+        last_error: String,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            update delivery_jobs
+            set state = 'failed', attempts = $2, last_error = $3
+            where id = $1
+            "#,
+        )
+        .bind(id.0)
+        .bind(attempts as i64)
+        .bind(last_error)
+        .execute(self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn reset_failed(&self) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            r#"
+            update delivery_jobs
+            set state = 'pending', next_attempt_at = $1
+            where state = 'failed'
+            "#,
+        )
+        .bind(Utc::now())
+        .execute(self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+}
+
 fn local_actor_from_row(row: sqlx::sqlite::SqliteRow) -> Result<LocalActor, DbError> {
     Ok(LocalActor {
         profile: actor_profile_from_columns(&row)?,
@@ -484,6 +765,34 @@ fn post_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Post, DbError> {
     })
 }
 
+fn follow_from_row(row: sqlx::sqlite::SqliteRow) -> Result<FollowRelation, DbError> {
+    Ok(FollowRelation {
+        local_actor_id: ActorId(row.try_get::<Uuid, _>("local_actor_id")?),
+        remote_actor_id: ActorId(row.try_get::<Uuid, _>("remote_actor_id")?),
+        remote_actor_url: parse_url(row.try_get("remote_actor_url")?)?,
+        state: follow_state_from_db(&row.try_get::<String, _>("state")?)?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn delivery_job_from_row(row: sqlx::sqlite::SqliteRow) -> Result<DeliveryJob, DbError> {
+    Ok(DeliveryJob {
+        id: DeliveryJobId(row.try_get::<Uuid, _>("id")?),
+        local_actor_id: ActorId(row.try_get::<Uuid, _>("local_actor_id")?),
+        target_inbox_url: parse_url(row.try_get("target_inbox_url")?)?,
+        kind: delivery_kind_from_db(&row.try_get::<String, _>("kind")?)?,
+        payload: row.try_get("payload")?,
+        state: delivery_state_from_db(&row.try_get::<String, _>("state")?)?,
+        attempts: row.try_get::<i64, _>("attempts")? as u32,
+        max_attempts: row.try_get::<i64, _>("max_attempts")? as u32,
+        next_attempt_at: row.try_get("next_attempt_at")?,
+        last_error: row.try_get("last_error")?,
+        created_at: row.try_get("created_at")?,
+        delivered_at: row.try_get("delivered_at")?,
+    })
+}
+
 fn parse_url(value: String) -> Result<Url, DbError> {
     Url::parse(&value).map_err(DbError::InvalidUrl)
 }
@@ -526,6 +835,57 @@ fn content_format_from_db(value: &str) -> Result<ContentFormat, DbError> {
     }
 }
 
+fn follow_state_to_db(state: &FollowState) -> &'static str {
+    match state {
+        FollowState::Pending => "pending",
+        FollowState::Active => "active",
+        FollowState::Rejected => "rejected",
+    }
+}
+
+fn follow_state_from_db(value: &str) -> Result<FollowState, DbError> {
+    match value {
+        "pending" => Ok(FollowState::Pending),
+        "active" => Ok(FollowState::Active),
+        "rejected" => Ok(FollowState::Rejected),
+        _ => Err(DbError::UnknownFollowState(value.to_string())),
+    }
+}
+
+fn delivery_kind_to_db(kind: &DeliveryKind) -> &'static str {
+    match kind {
+        DeliveryKind::Follow => "follow",
+        DeliveryKind::Create => "create",
+    }
+}
+
+fn delivery_kind_from_db(value: &str) -> Result<DeliveryKind, DbError> {
+    match value {
+        "follow" => Ok(DeliveryKind::Follow),
+        "create" => Ok(DeliveryKind::Create),
+        _ => Err(DbError::UnknownDeliveryKind(value.to_string())),
+    }
+}
+
+fn delivery_state_to_db(state: &DeliveryState) -> &'static str {
+    match state {
+        DeliveryState::Pending => "pending",
+        DeliveryState::Processing => "processing",
+        DeliveryState::Delivered => "delivered",
+        DeliveryState::Failed => "failed",
+    }
+}
+
+fn delivery_state_from_db(value: &str) -> Result<DeliveryState, DbError> {
+    match value {
+        "pending" => Ok(DeliveryState::Pending),
+        "processing" => Ok(DeliveryState::Processing),
+        "delivered" => Ok(DeliveryState::Delivered),
+        "failed" => Ok(DeliveryState::Failed),
+        _ => Err(DbError::UnknownDeliveryState(value.to_string())),
+    }
+}
+
 fn is_public_visibility(visibility: &Visibility) -> bool {
     matches!(visibility, Visibility::Public | Visibility::Unlisted)
 }
@@ -546,6 +906,12 @@ pub enum DbError {
     UnknownVisibility(String),
     #[error("unknown content format in database: {0}")]
     UnknownContentFormat(String),
+    #[error("unknown follow state in database: {0}")]
+    UnknownFollowState(String),
+    #[error("unknown delivery kind in database: {0}")]
+    UnknownDeliveryKind(String),
+    #[error("unknown delivery state in database: {0}")]
+    UnknownDeliveryState(String),
     #[error("invalid username in database: {0}")]
     InvalidUsername(UsernameError),
     #[error("invalid text value in database: {0}")]
@@ -555,7 +921,7 @@ pub enum DbError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kodamapub_domain::{NewPost, Visibility};
+    use kodamapub_domain::{DeliveryJob, DeliveryKind, FollowRelation, NewPost, Visibility};
     use url::Url;
 
     #[test]
@@ -602,14 +968,21 @@ mod tests {
             select count(*)
             from sqlite_master
             where type = 'table'
-              and name in ('actors', 'local_actor_secrets', 'remote_actor_state', 'posts')
+              and name in (
+                'actors',
+                'local_actor_secrets',
+                'remote_actor_state',
+                'posts',
+                'follows',
+                'delivery_jobs'
+              )
             "#,
         )
         .fetch_one(db.pool())
         .await
         .expect("count migrated tables");
 
-        assert_eq!(count, 4);
+        assert_eq!(count, 6);
     }
 
     #[tokio::test]
@@ -749,5 +1122,111 @@ mod tests {
             .await
             .expect("public post count");
         assert_eq!(total, 2);
+    }
+
+    #[tokio::test]
+    async fn follow_repository_round_trips_and_lists_active_remote_actors() {
+        let db = memory_db().await;
+        let local_actor = sample_local_actor();
+
+        db.local_actors()
+            .create(&local_actor)
+            .await
+            .expect("create local actor");
+
+        let remote_actor = RemoteActor {
+            profile: ActorProfile::new(
+                "bob".parse().expect("username"),
+                "Bob".parse().expect("display name"),
+                Some("remote actor".parse().expect("summary")),
+                Url::parse("https://remote.example/users/bob").expect("actor url"),
+                Some(Url::parse("https://remote.example/users/bob/inbox").expect("inbox url")),
+                Some(Url::parse("https://remote.example/users/bob/outbox").expect("outbox url")),
+            ),
+            public_key_pem: Some("REMOTE PUBLIC KEY".to_string()),
+            fetched_at: Utc::now(),
+        };
+
+        db.remote_actors()
+            .upsert(&remote_actor)
+            .await
+            .expect("upsert remote actor");
+
+        let mut follow = FollowRelation::new(local_actor.id(), &remote_actor);
+        follow.state = FollowState::Active;
+
+        db.follows().upsert(&follow).await.expect("upsert follow");
+
+        let found = db
+            .follows()
+            .find(local_actor.id(), remote_actor.id())
+            .await
+            .expect("find follow")
+            .expect("follow exists");
+
+        assert_eq!(found.state, FollowState::Active);
+
+        let active = db
+            .follows()
+            .list_active_remote_actors(local_actor.id())
+            .await
+            .expect("list active follows");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].profile.actor_url, remote_actor.profile.actor_url);
+    }
+
+    #[tokio::test]
+    async fn delivery_job_repository_round_trips_and_resets_failed_jobs() {
+        let db = memory_db().await;
+        let local_actor = sample_local_actor();
+
+        db.local_actors()
+            .create(&local_actor)
+            .await
+            .expect("create local actor");
+
+        let job = DeliveryJob::new(
+            local_actor.id(),
+            Url::parse("https://remote.example/users/bob/inbox").expect("inbox url"),
+            DeliveryKind::Follow,
+            "{\"type\":\"Follow\"}".to_string(),
+            5,
+        );
+
+        db.delivery_jobs()
+            .create(&job)
+            .await
+            .expect("create delivery job");
+        db.delivery_jobs()
+            .reschedule(job.id, 1, Utc::now(), "network error".to_string())
+            .await
+            .expect("reschedule delivery job");
+
+        let due = db
+            .delivery_jobs()
+            .list_due(Utc::now(), 10)
+            .await
+            .expect("list due jobs");
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].kind, DeliveryKind::Follow);
+
+        db.delivery_jobs()
+            .mark_failed(job.id, 2, "final error".to_string())
+            .await
+            .expect("mark final failed");
+        let reset = db
+            .delivery_jobs()
+            .reset_failed()
+            .await
+            .expect("reset failed jobs");
+        assert_eq!(reset, 1);
+
+        let found = db
+            .delivery_jobs()
+            .find(job.id)
+            .await
+            .expect("find delivery job")
+            .expect("job exists");
+        assert_eq!(found.state, DeliveryState::Pending);
     }
 }

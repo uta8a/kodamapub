@@ -1,11 +1,45 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
-use kodamapub_domain::{ActorProfile, LocalActor, Post, PostId, RemoteActor, Visibility};
+use kodamapub_domain::{
+    ActorProfile, DeliveryKind, LocalActor, Post, PostId, RemoteActor, Visibility,
+};
+use reqwest::{
+    Client,
+    header::{ACCEPT, CONTENT_TYPE, DATE, HOST, HeaderMap, HeaderValue},
+};
+use rsa::{
+    RsaPrivateKey,
+    pkcs1v15::SigningKey,
+    pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey, LineEnding},
+    rand_core::OsRng,
+    signature::{RandomizedSigner, SignatureEncoding},
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use url::Url;
+use uuid::Uuid;
 
 const ACTIVITY_STREAMS_CONTEXT: &str = "https://www.w3.org/ns/activitystreams";
 const SECURITY_CONTEXT: &str = "https://w3id.org/security/v1";
 const PUBLIC_COLLECTION: &str = "https://www.w3.org/ns/activitystreams#Public";
+
+#[derive(Debug, thiserror::Error)]
+pub enum ActivityPubError {
+    #[error("request failed: {0}")]
+    Request(#[from] reqwest::Error),
+    #[error("invalid remote resource: {0}")]
+    InvalidResource(String),
+    #[error("remote actor missing inbox url")]
+    MissingInboxUrl,
+    #[error("remote actor missing id")]
+    MissingActorId,
+    #[error("unable to generate local actor keypair: {0}")]
+    KeyGeneration(String),
+    #[error("unable to sign request: {0}")]
+    Signing(String),
+    #[error("unable to serialize activity payload: {0}")]
+    Serialize(#[from] serde_json::Error),
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PublicKeyObject {
@@ -71,6 +105,39 @@ pub struct CreateActivity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FollowActivity {
+    #[serde(rename = "@context")]
+    pub context: String,
+    pub id: Url,
+    #[serde(rename = "type")]
+    pub object_type: String,
+    pub actor: Url,
+    pub object: Url,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcceptActivity {
+    #[serde(rename = "@context")]
+    pub context: String,
+    pub id: Url,
+    #[serde(rename = "type")]
+    pub object_type: String,
+    pub actor: Url,
+    pub object: Url,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UndoActivity {
+    #[serde(rename = "@context")]
+    pub context: String,
+    pub id: Url,
+    #[serde(rename = "type")]
+    pub object_type: String,
+    pub actor: Url,
+    pub object: Url,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OrderedCollection {
     #[serde(rename = "@context")]
     pub context: String,
@@ -110,6 +177,138 @@ pub struct WebFingerLink {
 pub struct WebFingerResponse {
     pub subject: String,
     pub links: Vec<WebFingerLink>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteActorDiscovery {
+    pub resource: String,
+    pub actor: RemoteActor,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteActorResponse {
+    id: Option<Url>,
+    #[serde(rename = "preferredUsername")]
+    preferred_username: Option<String>,
+    name: Option<String>,
+    summary: Option<String>,
+    inbox: Option<Url>,
+    outbox: Option<Url>,
+    #[serde(rename = "publicKey")]
+    public_key: Option<PublicKeyObject>,
+}
+
+pub fn generate_local_actor_keypair_pem() -> Result<(String, String), ActivityPubError> {
+    let mut rng = OsRng;
+    let private_key = RsaPrivateKey::new(&mut rng, 2048)
+        .map_err(|error| ActivityPubError::KeyGeneration(error.to_string()))?;
+    let public_key = private_key.to_public_key();
+
+    let private_key_pem = private_key
+        .to_pkcs8_pem(LineEnding::LF)
+        .map_err(|error| ActivityPubError::KeyGeneration(error.to_string()))?
+        .to_string();
+    let public_key_pem = public_key
+        .to_public_key_pem(LineEnding::LF)
+        .map_err(|error| ActivityPubError::KeyGeneration(error.to_string()))?;
+
+    Ok((public_key_pem, private_key_pem))
+}
+
+pub async fn discover_remote_actor(
+    client: &Client,
+    resource: &str,
+) -> Result<RemoteActorDiscovery, ActivityPubError> {
+    let (username, host) = parse_acct_resource(resource)?;
+    let webfinger_url = webfinger_url_for_host(&host, resource)?;
+
+    let webfinger = client
+        .get(webfinger_url)
+        .header(ACCEPT, "application/jrd+json, application/json")
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<WebFingerResponse>()
+        .await?;
+
+    let actor_url = webfinger
+        .links
+        .iter()
+        .find(|link| link.rel == "self")
+        .map(|link| link.href.clone())
+        .ok_or_else(|| {
+            ActivityPubError::InvalidResource("webfinger self link missing".to_string())
+        })?;
+
+    let actor_json = client
+        .get(actor_url.clone())
+        .header(ACCEPT, "application/activity+json, application/ld+json")
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RemoteActorResponse>()
+        .await?;
+
+    let actor_id = actor_json.id.clone().unwrap_or(actor_url);
+    let preferred_username = actor_json
+        .preferred_username
+        .unwrap_or_else(|| username.clone());
+    let username = preferred_username
+        .parse::<kodamapub_domain::Username>()
+        .or_else(|_| username.parse::<kodamapub_domain::Username>())
+        .map_err(|error| ActivityPubError::InvalidResource(error.to_string()))?;
+    let display_name = actor_json
+        .name
+        .unwrap_or_else(|| preferred_username.clone())
+        .parse::<kodamapub_domain::DisplayName>()
+        .map_err(|error| ActivityPubError::InvalidResource(error.to_string()))?;
+    let summary = actor_json
+        .summary
+        .as_deref()
+        .map(|value| value.parse::<kodamapub_domain::Summary>())
+        .transpose()
+        .map_err(|error| ActivityPubError::InvalidResource(error.to_string()))?;
+
+    let actor = RemoteActor {
+        profile: ActorProfile::new(
+            username,
+            display_name,
+            summary,
+            actor_id,
+            actor_json.inbox,
+            actor_json.outbox,
+        ),
+        public_key_pem: actor_json.public_key.map(|key| key.public_key_pem),
+        fetched_at: Utc::now(),
+    };
+
+    Ok(RemoteActorDiscovery {
+        resource: resource.to_string(),
+        actor,
+    })
+}
+
+pub async fn deliver_signed_activity(
+    client: &Client,
+    actor: &LocalActor,
+    target_inbox_url: &Url,
+    body: &str,
+) -> Result<(), ActivityPubError> {
+    let headers = signed_headers(actor, "post", target_inbox_url, body)?;
+
+    client
+        .post(target_inbox_url.clone())
+        .headers(headers)
+        .body(body.to_string())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    Ok(())
+}
+
+pub fn serialize_activity<T: Serialize>(value: &T) -> Result<String, ActivityPubError> {
+    serde_json::to_string(value).map_err(ActivityPubError::from)
 }
 
 pub fn actor_profile_to_object(actor: &ActorProfile) -> ActorObject {
@@ -194,6 +393,19 @@ pub fn post_to_create_activity(post: &Post, actor: &ActorProfile) -> CreateActiv
     }
 }
 
+pub fn follow_activity(local_actor: &LocalActor, remote_actor: &RemoteActor) -> FollowActivity {
+    FollowActivity {
+        context: ACTIVITY_STREAMS_CONTEXT.to_string(),
+        id: follow_activity_id(
+            &local_actor.profile.actor_url,
+            &remote_actor.profile.actor_url,
+        ),
+        object_type: "Follow".to_string(),
+        actor: local_actor.profile.actor_url.clone(),
+        object: remote_actor.profile.actor_url.clone(),
+    }
+}
+
 pub fn ordered_collection(id: Url, first: Option<Url>, total_items: u64) -> OrderedCollection {
     OrderedCollection {
         context: ACTIVITY_STREAMS_CONTEXT.to_string(),
@@ -235,6 +447,131 @@ pub fn is_publicly_visible(visibility: &Visibility) -> bool {
     matches!(visibility, Visibility::Public | Visibility::Unlisted)
 }
 
+pub fn activity_kind_for_payload(payload: &str) -> Result<DeliveryKind, ActivityPubError> {
+    let json: serde_json::Value = serde_json::from_str(payload)?;
+    match json.get("type").and_then(|value| value.as_str()) {
+        Some("Follow") => Ok(DeliveryKind::Follow),
+        Some("Create") => Ok(DeliveryKind::Create),
+        Some(other) => Err(ActivityPubError::InvalidResource(format!(
+            "unsupported activity type {other}"
+        ))),
+        None => Err(ActivityPubError::InvalidResource(
+            "activity payload missing type".to_string(),
+        )),
+    }
+}
+
+fn signed_headers(
+    actor: &LocalActor,
+    method: &str,
+    url: &Url,
+    body: &str,
+) -> Result<HeaderMap, ActivityPubError> {
+    let digest = digest_header_value(body);
+    let host =
+        host_header_value(url).map_err(|error| ActivityPubError::Signing(error.to_string()))?;
+    let date = http_date(Utc::now());
+    let path = match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    };
+    let signing_string = format!(
+        "(request-target): {} {}\nhost: {}\ndate: {}\ndigest: {}",
+        method.to_ascii_lowercase(),
+        path,
+        host,
+        date,
+        digest
+    );
+
+    let private_key = RsaPrivateKey::from_pkcs8_pem(&actor.private_key_pem)
+        .map_err(|error| ActivityPubError::Signing(error.to_string()))?;
+    let signing_key = SigningKey::<Sha256>::new_unprefixed(private_key);
+    let signature = signing_key.sign_with_rng(&mut OsRng, signing_string.as_bytes());
+    let signature_header = format!(
+        "keyId=\"{}\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date digest\",signature=\"{}\"",
+        key_id_url(&actor.profile.actor_url),
+        STANDARD.encode(signature.to_vec())
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/activity+json, application/ld+json"),
+    );
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/activity+json"),
+    );
+    headers.insert(
+        HOST,
+        HeaderValue::from_str(&host)
+            .map_err(|error| ActivityPubError::Signing(error.to_string()))?,
+    );
+    headers.insert(
+        DATE,
+        HeaderValue::from_str(&date)
+            .map_err(|error| ActivityPubError::Signing(error.to_string()))?,
+    );
+    headers.insert(
+        "Digest",
+        HeaderValue::from_str(&digest)
+            .map_err(|error| ActivityPubError::Signing(error.to_string()))?,
+    );
+    headers.insert(
+        "Signature",
+        HeaderValue::from_str(&signature_header)
+            .map_err(|error| ActivityPubError::Signing(error.to_string()))?,
+    );
+
+    Ok(headers)
+}
+
+fn parse_acct_resource(resource: &str) -> Result<(String, String), ActivityPubError> {
+    let value = resource
+        .strip_prefix("acct:")
+        .ok_or_else(|| ActivityPubError::InvalidResource(resource.to_string()))?;
+    let (username, host) = value
+        .split_once('@')
+        .ok_or_else(|| ActivityPubError::InvalidResource(resource.to_string()))?;
+    Ok((username.to_string(), host.to_string()))
+}
+
+fn webfinger_url_for_host(host: &str, resource: &str) -> Result<Url, ActivityPubError> {
+    let scheme = if host.starts_with("localhost")
+        || host.starts_with("127.0.0.1")
+        || host.starts_with("[::1]")
+    {
+        "http"
+    } else {
+        "https"
+    };
+    Url::parse(&format!(
+        "{scheme}://{host}/.well-known/webfinger?resource={resource}"
+    ))
+    .map_err(|error| ActivityPubError::InvalidResource(error.to_string()))
+}
+
+fn digest_header_value(body: &str) -> String {
+    let hash = Sha256::digest(body.as_bytes());
+    format!("SHA-256={}", STANDARD.encode(hash))
+}
+
+fn host_header_value(url: &Url) -> Result<String, ActivityPubError> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| ActivityPubError::InvalidResource(url.to_string()))?;
+
+    Ok(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
+}
+
+fn http_date(now: DateTime<Utc>) -> String {
+    now.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+}
+
 fn visibility_audience(visibility: &Visibility) -> (Vec<Url>, Vec<Url>) {
     let public = Url::parse(PUBLIC_COLLECTION).expect("public collection URL");
 
@@ -261,6 +598,29 @@ fn create_activity_id(note_id: &Url) -> Url {
     Url::parse(&format!("{}#create", note_id.as_str())).expect("create activity URL")
 }
 
+fn follow_activity_id(local_actor_url: &Url, remote_actor_url: &Url) -> Url {
+    Url::parse(&format!(
+        "{}#follow-{}-{}",
+        local_actor_url.as_str(),
+        sanitize_for_fragment(remote_actor_url.host_str().unwrap_or("remote")),
+        Uuid::now_v7()
+    ))
+    .expect("follow activity URL")
+}
+
+fn sanitize_for_fragment(value: &str) -> String {
+    value
+        .chars()
+        .map(|char| {
+            if char.is_ascii_alphanumeric() || matches!(char, '-' | '_') {
+                char
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 fn reply_to_post_url(post: &Post, reply_to: PostId) -> Option<Url> {
     let (prefix, _) = post.url.as_str().rsplit_once("/posts/")?;
     Url::parse(&format!("{prefix}/posts/{reply_to}")).ok()
@@ -269,7 +629,15 @@ fn reply_to_post_url(post: &Post, reply_to: PostId) -> Option<Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kodamapub_domain::{ActorProfile, ContentFormat, LocalActor, NewPost, Username};
+    use axum::{
+        Json, Router,
+        extract::Query,
+        response::IntoResponse,
+        routing::{get, post},
+    };
+    use kodamapub_domain::{ActorProfile, ContentFormat, NewPost, Username};
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::sync::Mutex;
 
     fn sample_actor_profile() -> ActorProfile {
         ActorProfile::new(
@@ -283,10 +651,12 @@ mod tests {
     }
 
     fn sample_local_actor() -> LocalActor {
+        let (public_key_pem, private_key_pem) =
+            generate_local_actor_keypair_pem().expect("generate keypair");
         LocalActor {
             profile: sample_actor_profile(),
-            public_key_pem: "PUBLIC KEY".to_string(),
-            private_key_pem: "PRIVATE KEY".to_string(),
+            public_key_pem,
+            private_key_pem,
         }
     }
 
@@ -348,5 +718,136 @@ mod tests {
         assert_eq!(response.links.len(), 1);
         assert_eq!(response.links[0].rel, "self");
         assert_eq!(response.links[0].media_type, "application/activity+json");
+    }
+
+    #[test]
+    fn follow_activity_targets_remote_actor() {
+        let local_actor = sample_local_actor();
+        let remote_actor = RemoteActor {
+            profile: ActorProfile::new(
+                "bob".parse().expect("username"),
+                "Bob".parse().expect("display name"),
+                None,
+                Url::parse("https://remote.example/users/bob").expect("actor url"),
+                Some(Url::parse("https://remote.example/users/bob/inbox").expect("inbox")),
+                Some(Url::parse("https://remote.example/users/bob/outbox").expect("outbox")),
+            ),
+            public_key_pem: None,
+            fetched_at: Utc::now(),
+        };
+
+        let activity = follow_activity(&local_actor, &remote_actor);
+        assert_eq!(activity.object_type, "Follow");
+        assert_eq!(activity.actor, local_actor.profile.actor_url);
+        assert_eq!(activity.object, remote_actor.profile.actor_url);
+    }
+
+    #[tokio::test]
+    async fn discovers_remote_actor_from_webfinger_and_actor_json() {
+        async fn webfinger(Query(query): Query<HashMap<String, String>>) -> impl IntoResponse {
+            Json(webfinger_response(
+                query["resource"].clone(),
+                Url::parse("http://127.0.0.1:38901/users/bob").expect("actor url"),
+            ))
+        }
+
+        async fn actor() -> impl IntoResponse {
+            Json(serde_json::json!({
+                "@context": "https://www.w3.org/ns/activitystreams",
+                "id": "http://127.0.0.1:38901/users/bob",
+                "preferredUsername": "bob",
+                "name": "Bob",
+                "summary": "remote actor",
+                "inbox": "http://127.0.0.1:38901/users/bob/inbox",
+                "outbox": "http://127.0.0.1:38901/users/bob/outbox"
+            }))
+        }
+
+        let app = Router::new()
+            .route("/.well-known/webfinger", get(webfinger))
+            .route("/users/bob", get(actor));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:38901")
+            .await
+            .expect("bind test server");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let client = Client::new();
+        let discovery = discover_remote_actor(&client, "acct:bob@127.0.0.1:38901")
+            .await
+            .expect("discover remote actor");
+
+        assert_eq!(discovery.actor.profile.username.as_str(), "bob");
+        assert_eq!(
+            discovery.actor.profile.inbox_url.expect("inbox").as_str(),
+            "http://127.0.0.1:38901/users/bob/inbox"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn signed_delivery_posts_activity_payload() {
+        #[derive(Clone, Default)]
+        struct InboxState {
+            requests: Arc<Mutex<Vec<(String, String)>>>,
+        }
+
+        async fn inbox(
+            headers: HeaderMap,
+            axum::extract::State(state): axum::extract::State<InboxState>,
+            body: String,
+        ) -> impl IntoResponse {
+            let signature = headers
+                .get("Signature")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            state.requests.lock().await.push((signature, body));
+            axum::http::StatusCode::ACCEPTED
+        }
+
+        let state = InboxState::default();
+        let app = Router::new()
+            .route("/inbox", post(inbox))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:38902")
+            .await
+            .expect("bind test server");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let actor = sample_local_actor();
+        let remote_inbox = Url::parse("http://127.0.0.1:38902/inbox").expect("inbox url");
+        let payload = serialize_activity(&follow_activity(
+            &actor,
+            &RemoteActor {
+                profile: ActorProfile::new(
+                    "bob".parse().expect("username"),
+                    "Bob".parse().expect("display name"),
+                    None,
+                    Url::parse("http://127.0.0.1:38902/users/bob").expect("actor url"),
+                    Some(remote_inbox.clone()),
+                    None,
+                ),
+                public_key_pem: None,
+                fetched_at: Utc::now(),
+            },
+        ))
+        .expect("serialize activity");
+
+        deliver_signed_activity(&Client::new(), &actor, &remote_inbox, &payload)
+            .await
+            .expect("deliver activity");
+
+        let requests = state.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].0.contains("rsa-sha256"));
+        assert!(requests[0].1.contains("\"type\":\"Follow\""));
+
+        server.abort();
     }
 }

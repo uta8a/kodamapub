@@ -1,9 +1,14 @@
 use clap::{Parser, Subcommand};
+use kodamapub_activitypub::{discover_remote_actor, generate_local_actor_keypair_pem};
 use kodamapub_db::Database;
 use kodamapub_domain::{
     ActorProfile, ContentFormat, ContentSource, DisplayName, LocalActor, NewPost, Post,
     PublicBaseUrl, Summary, Username, Visibility,
 };
+use kodamapub_job::{
+    RetryPolicy, enqueue_follow_delivery, process_due_jobs, retry_failed_deliveries,
+};
+use reqwest::Client;
 use url::Url;
 
 #[derive(Debug, Parser)]
@@ -43,6 +48,24 @@ enum Command {
         display_name: DisplayName,
         #[arg(long, default_value = "Seeded demo account")]
         summary: Summary,
+    },
+    Follow {
+        #[arg(long, env = "DATABASE_URL", default_value = "sqlite://kodamapub.db")]
+        database_url: String,
+        #[arg(long)]
+        local_username: Username,
+        #[arg(long)]
+        resource: String,
+    },
+    RetryDeliveries {
+        #[arg(long, env = "DATABASE_URL", default_value = "sqlite://kodamapub.db")]
+        database_url: String,
+    },
+    RunDeliveries {
+        #[arg(long, env = "DATABASE_URL", default_value = "sqlite://kodamapub.db")]
+        database_url: String,
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
     },
 }
 
@@ -119,6 +142,55 @@ async fn main() -> anyhow::Result<()> {
                 actor.profile.actor_url, created
             );
         }
+        Command::Follow {
+            database_url,
+            local_username,
+            resource,
+        } => {
+            let db = Database::connect(&database_url).await?;
+            db.migrate().await?;
+
+            let local_actor = db
+                .local_actors()
+                .find_by_username(&local_username)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("local actor not found: {local_username}"))?;
+
+            let discovery = discover_remote_actor(&Client::new(), &resource).await?;
+            db.remote_actors().upsert(&discovery.actor).await?;
+
+            let job = enqueue_follow_delivery(
+                &db,
+                &local_actor,
+                &discovery.actor,
+                &RetryPolicy::default(),
+            )
+            .await?;
+            let summary = process_due_jobs(&db, &RetryPolicy::default(), 100).await?;
+
+            println!(
+                "queued follow job {} and delivered={} rescheduled={} failed={}",
+                job.id.0, summary.delivered, summary.rescheduled, summary.failed
+            );
+        }
+        Command::RetryDeliveries { database_url } => {
+            let db = Database::connect(&database_url).await?;
+            db.migrate().await?;
+            let reset = retry_failed_deliveries(&db).await?;
+            println!("reset {reset} failed delivery jobs");
+        }
+        Command::RunDeliveries {
+            database_url,
+            limit,
+        } => {
+            let db = Database::connect(&database_url).await?;
+            db.migrate().await?;
+            let summary = process_due_jobs(&db, &RetryPolicy::default(), limit).await?;
+            println!(
+                "delivered={} rescheduled={} failed={}",
+                summary.delivered, summary.rescheduled, summary.failed
+            );
+        }
     }
 
     Ok(())
@@ -131,6 +203,7 @@ fn build_local_actor(
     summary: Option<Summary>,
 ) -> anyhow::Result<LocalActor> {
     let base = public_base_url.as_str().trim_end_matches('/');
+    let (public_key_pem, private_key_pem) = generate_local_actor_keypair_pem()?;
     let actor = LocalActor {
         profile: ActorProfile::new(
             username.clone(),
@@ -140,9 +213,8 @@ fn build_local_actor(
             Some(Url::parse(&format!("{base}/users/{username}/inbox"))?),
             Some(Url::parse(&format!("{base}/users/{username}/outbox"))?),
         ),
-        // Placeholder keys until real key generation is implemented.
-        public_key_pem: format!("LOCAL PUBLIC KEY {}", username),
-        private_key_pem: format!("LOCAL PRIVATE KEY {}", username),
+        public_key_pem,
+        private_key_pem,
     };
 
     Ok(actor)

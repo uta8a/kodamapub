@@ -17,6 +17,7 @@ use kodamapub_domain::{
     ContentFormat, ContentSource, DomainError, NewPost, Post, PostId, PublicBaseUrl, Username,
     Visibility,
 };
+use kodamapub_job::{JobError, RetryPolicy, enqueue_create_deliveries};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -97,6 +98,12 @@ impl From<DomainError> for ApiError {
             DomainError::InvalidPublicBaseUrl(_) => Self::Internal(value.into()),
             DomainError::NotFound => Self::NotFound("resource not found"),
         }
+    }
+}
+
+impl From<JobError> for ApiError {
+    fn from(value: JobError) -> Self {
+        Self::Internal(value.into())
     }
 }
 
@@ -182,6 +189,7 @@ async fn create_user_post(
     )?;
 
     state.db.posts().create(&post).await?;
+    enqueue_create_deliveries(&state.db, &actor, &post, &RetryPolicy::default()).await?;
     Ok((StatusCode::CREATED, Json(post)))
 }
 
