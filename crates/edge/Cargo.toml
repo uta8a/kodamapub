@@ -1,0 +1,20 @@
+[package]
+name = "kodamapub-edge"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "kodamapub-edge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+env_logger.workspace = true
+log.workspace = true
+pingora.workspace = true
