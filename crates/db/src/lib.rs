@@ -116,6 +116,31 @@ impl<'a> LocalActorRepository<'a> {
 
         row.map(local_actor_from_row).transpose()
     }
+
+    pub async fn find_by_id(&self, actor_id: ActorId) -> Result<Option<LocalActor>, DbError> {
+        let row = sqlx::query(
+            r#"
+            select
+                a.id,
+                a.username,
+                a.display_name,
+                a.summary,
+                a.actor_url,
+                a.inbox_url,
+                a.outbox_url,
+                s.public_key_pem,
+                s.private_key_pem
+            from actors a
+            join local_actor_secrets s on s.actor_id = a.id
+            where a.id = $1
+            "#,
+        )
+        .bind(actor_id.0)
+        .fetch_optional(self.pool)
+        .await?;
+
+        row.map(local_actor_from_row).transpose()
+    }
 }
 
 pub struct RemoteActorRepository<'a> {
@@ -199,6 +224,11 @@ pub struct PostRepository<'a> {
     pool: &'a SqlitePool,
 }
 
+pub struct PostPage {
+    pub posts: Vec<Post>,
+    pub next_cursor: Option<PostId>,
+}
+
 impl<'a> PostRepository<'a> {
     pub async fn create(&self, post: &Post) -> Result<(), DbError> {
         sqlx::query(
@@ -241,24 +271,158 @@ impl<'a> PostRepository<'a> {
         row.map(post_from_row).transpose()
     }
 
-    pub async fn list_by_actor(&self, actor_id: ActorId, limit: i64) -> Result<Vec<Post>, DbError> {
-        let rows = sqlx::query(
+    pub async fn list_by_actor(
+        &self,
+        actor_id: ActorId,
+        before: Option<PostId>,
+        limit: i64,
+    ) -> Result<PostPage, DbError> {
+        let rows = match before {
+            Some(before) => {
+                let before_post = self.find(before).await?.ok_or(sqlx::Error::RowNotFound)?;
+
+                sqlx::query(
+                    r#"
+                    select
+                        id, actor_id, url, content_source, content_format,
+                        content_html, visibility, in_reply_to, created_at
+                    from posts
+                    where actor_id = $1
+                      and (
+                        created_at < $2
+                        or (created_at = $2 and id < $3)
+                      )
+                    order by created_at desc, id desc
+                    limit $4
+                    "#,
+                )
+                .bind(actor_id.0)
+                .bind(before_post.created_at)
+                .bind(before_post.id.0)
+                .bind(limit + 1)
+                .fetch_all(self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    r#"
+                    select
+                        id, actor_id, url, content_source, content_format,
+                        content_html, visibility, in_reply_to, created_at
+                    from posts
+                    where actor_id = $1
+                    order by created_at desc, id desc
+                    limit $2
+                    "#,
+                )
+                .bind(actor_id.0)
+                .bind(limit + 1)
+                .fetch_all(self.pool)
+                .await?
+            }
+        };
+
+        let mut posts: Vec<Post> = rows
+            .into_iter()
+            .map(post_from_row)
+            .collect::<Result<_, _>>()?;
+        let next_cursor = if posts.len() > limit as usize {
+            posts.pop().expect("extra post for pagination");
+            posts.last().map(|post| post.id)
+        } else {
+            None
+        };
+
+        Ok(PostPage { posts, next_cursor })
+    }
+
+    pub async fn list_public_by_actor(
+        &self,
+        actor_id: ActorId,
+        before: Option<PostId>,
+        limit: i64,
+    ) -> Result<PostPage, DbError> {
+        let rows = match before {
+            Some(before) => {
+                let before_post = self.find(before).await?.ok_or(sqlx::Error::RowNotFound)?;
+
+                if before_post.actor_id != actor_id
+                    || !is_public_visibility(&before_post.visibility)
+                {
+                    return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
+                }
+
+                sqlx::query(
+                    r#"
+                    select
+                        id, actor_id, url, content_source, content_format,
+                        content_html, visibility, in_reply_to, created_at
+                    from posts
+                    where actor_id = $1
+                      and visibility in ('public', 'unlisted')
+                      and (
+                        created_at < $2
+                        or (created_at = $2 and id < $3)
+                      )
+                    order by created_at desc, id desc
+                    limit $4
+                    "#,
+                )
+                .bind(actor_id.0)
+                .bind(before_post.created_at)
+                .bind(before_post.id.0)
+                .bind(limit + 1)
+                .fetch_all(self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    r#"
+                    select
+                        id, actor_id, url, content_source, content_format,
+                        content_html, visibility, in_reply_to, created_at
+                    from posts
+                    where actor_id = $1
+                      and visibility in ('public', 'unlisted')
+                    order by created_at desc, id desc
+                    limit $2
+                    "#,
+                )
+                .bind(actor_id.0)
+                .bind(limit + 1)
+                .fetch_all(self.pool)
+                .await?
+            }
+        };
+
+        let mut posts: Vec<Post> = rows
+            .into_iter()
+            .map(post_from_row)
+            .collect::<Result<_, _>>()?;
+        let next_cursor = if posts.len() > limit as usize {
+            posts.pop().expect("extra post for pagination");
+            posts.last().map(|post| post.id)
+        } else {
+            None
+        };
+
+        Ok(PostPage { posts, next_cursor })
+    }
+
+    pub async fn count_public_by_actor(&self, actor_id: ActorId) -> Result<i64, DbError> {
+        let count = sqlx::query_scalar(
             r#"
-            select
-                id, actor_id, url, content_source, content_format,
-                content_html, visibility, in_reply_to, created_at
+            select count(*)
             from posts
             where actor_id = $1
-            order by created_at desc
-            limit $2
+              and visibility in ('public', 'unlisted')
             "#,
         )
         .bind(actor_id.0)
-        .bind(limit)
-        .fetch_all(self.pool)
+        .fetch_one(self.pool)
         .await?;
 
-        rows.into_iter().map(post_from_row).collect()
+        Ok(count)
     }
 }
 
@@ -360,6 +524,10 @@ fn content_format_from_db(value: &str) -> Result<ContentFormat, DbError> {
         "markdown" => Ok(ContentFormat::Markdown),
         _ => Err(DbError::UnknownContentFormat(value.to_string())),
     }
+}
+
+fn is_public_visibility(visibility: &Visibility) -> bool {
+    matches!(visibility, Visibility::Public | Visibility::Unlisted)
 }
 
 fn opt_url_str(url: &Option<Url>) -> Option<&str> {
@@ -496,5 +664,90 @@ mod tests {
             .expect("post exists");
 
         assert_eq!(found, post);
+    }
+
+    #[tokio::test]
+    async fn list_public_by_actor_filters_private_posts_and_paginates() {
+        let db = memory_db().await;
+        let actor = sample_local_actor();
+
+        db.local_actors()
+            .create(&actor)
+            .await
+            .expect("create local actor");
+
+        let public_post = Post::new(
+            NewPost {
+                actor_id: actor.id(),
+                content_source: "public".parse().expect("content source"),
+                content_format: ContentFormat::Plaintext,
+                visibility: Visibility::Public,
+                in_reply_to: None,
+            },
+            &"https://example.invalid".parse().expect("public base url"),
+        )
+        .expect("public post");
+        let unlisted_post = Post::new(
+            NewPost {
+                actor_id: actor.id(),
+                content_source: "unlisted".parse().expect("content source"),
+                content_format: ContentFormat::Plaintext,
+                visibility: Visibility::Unlisted,
+                in_reply_to: None,
+            },
+            &"https://example.invalid".parse().expect("public base url"),
+        )
+        .expect("unlisted post");
+        let direct_post = Post::new(
+            NewPost {
+                actor_id: actor.id(),
+                content_source: "direct".parse().expect("content source"),
+                content_format: ContentFormat::Plaintext,
+                visibility: Visibility::Direct,
+                in_reply_to: None,
+            },
+            &"https://example.invalid".parse().expect("public base url"),
+        )
+        .expect("direct post");
+
+        db.posts()
+            .create(&public_post)
+            .await
+            .expect("insert public post");
+        db.posts()
+            .create(&unlisted_post)
+            .await
+            .expect("insert unlisted post");
+        db.posts()
+            .create(&direct_post)
+            .await
+            .expect("insert direct post");
+
+        let page = db
+            .posts()
+            .list_public_by_actor(actor.id(), None, 1)
+            .await
+            .expect("public page");
+
+        assert_eq!(page.posts.len(), 1);
+        assert!(page.next_cursor.is_some());
+        assert!(is_public_visibility(&page.posts[0].visibility));
+
+        let next_page = db
+            .posts()
+            .list_public_by_actor(actor.id(), page.next_cursor, 1)
+            .await
+            .expect("next public page");
+
+        assert_eq!(next_page.posts.len(), 1);
+        assert!(next_page.next_cursor.is_none());
+        assert!(is_public_visibility(&next_page.posts[0].visibility));
+
+        let total = db
+            .posts()
+            .count_public_by_actor(actor.id())
+            .await
+            .expect("public post count");
+        assert_eq!(total, 2);
     }
 }
