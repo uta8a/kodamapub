@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use kodamapub_domain::{Actor, Post};
+use kodamapub_domain::{ActorProfile, LocalActor, Post, RemoteActor};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -16,17 +16,25 @@ pub struct NoteObject {
     pub published: DateTime<Utc>,
 }
 
-pub fn actor_to_object(actor: &Actor) -> ActorObject {
+pub fn actor_profile_to_object(actor: &ActorProfile) -> ActorObject {
     ActorObject {
-        id: actor.url.clone(),
+        id: actor.actor_url.clone(),
         preferred_username: actor.username.clone(),
     }
+}
+
+pub fn local_actor_to_object(actor: &LocalActor) -> ActorObject {
+    actor_profile_to_object(&actor.profile)
+}
+
+pub fn remote_actor_to_object(actor: &RemoteActor) -> ActorObject {
+    actor_profile_to_object(&actor.profile)
 }
 
 pub fn post_to_note(post: &Post) -> NoteObject {
     NoteObject {
         id: post.url.clone(),
-        content: post.content.clone(),
+        content: post.content_html.clone(),
         published: post.created_at,
     }
 }
