@@ -14,7 +14,14 @@ function wantsActivityPub(request: Request): boolean {
 function copyProxyHeaders(upstream: Response): Headers {
   const headers = new Headers();
 
-  for (const name of ["content-type", "cache-control", "etag", "last-modified", "content-length"]) {
+  for (const name of [
+    "content-type",
+    "cache-control",
+    "etag",
+    "last-modified",
+    "content-length",
+    "set-cookie",
+  ]) {
     const value = upstream.headers.get(name);
     if (value) {
       headers.set(name, value);
@@ -30,6 +37,7 @@ async function proxyToApi(request: Request, path: string): Promise<Response> {
     headers: {
       accept: request.headers.get("accept") ?? "application/json",
       "content-type": request.headers.get("content-type") ?? "application/json",
+      cookie: request.headers.get("cookie") ?? "",
     },
     body:
       request.method === "GET" || request.method === "HEAD"
@@ -49,6 +57,12 @@ app.get("/.well-known/webfinger", (c) => {
   const search = new URL(c.req.url).search;
   return proxyToApi(c.req.raw, `/api/.well-known/webfinger${search}`);
 });
+
+app.get("/api/session", (c) => proxyToApi(c.req.raw, "/api/session"));
+
+app.post("/api/login", (c) => proxyToApi(c.req.raw, "/api/login"));
+
+app.post("/api/logout", (c) => proxyToApi(c.req.raw, "/api/logout"));
 
 app.on(["GET", "POST"], "/users/:username/posts", async (c) => {
   const username = encodeURIComponent(c.req.param("username"));

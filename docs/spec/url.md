@@ -55,6 +55,9 @@ backend API は Rust server が直接提供する内部向け endpoint です。
 ```txt
 /api/health
 /api/.well-known/webfinger
+/api/login
+/api/logout
+/api/session
 /api/users/:username
 /api/users/:username/posts
 /api/users/:username/outbox
@@ -67,6 +70,12 @@ content negotiation は次の通りです。
 - `GET /api/users/:username`
   - `Accept: application/activity+json` なら Actor JSON
   - それ以外は frontend 向け JSON
+- `POST /api/login`
+  - `username` と `password` を受け取り session cookie を返す
+- `GET /api/session`
+  - 現在の session に対応する actor を返す
+- `POST /api/logout`
+  - 現在の session cookie を無効化する
 - `GET /api/posts/:postId`
   - `Accept: application/activity+json` なら Note object
   - それ以外は frontend 向け JSON

@@ -8,16 +8,18 @@ import {
   useState,
 } from "react";
 import { Link, Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
-import { createPost, getActor, getPost, listPosts } from "./api";
+import { createPost, getActor, getPost, getSession, listPosts, login, logout } from "./api";
 import type { ActorProfile, Post } from "./types";
 
 const defaultUsername = import.meta.env.VITE_DEFAULT_USERNAME ?? "alice";
-const sessionStorageKey = "kodamapub.active-username";
+
+type SessionStatus = "loading" | "anonymous" | "authenticated";
 
 type SessionContextValue = {
-  activeUsername: string | null;
-  setActiveUsername: (username: string | null) => void;
-  signOut: () => void;
+  actor: ActorProfile | null;
+  status: SessionStatus;
+  login: (input: { username: string; password: string }) => Promise<void>;
+  logout: () => Promise<void>;
 };
 
 const SessionContext = createContext<SessionContextValue | null>(null);
@@ -47,32 +49,51 @@ function useSession() {
 }
 
 function SessionProvider({ children }: { children: ReactNode }) {
-  const [activeUsername, setActiveUsernameState] = useState<string | null>(() => {
-    const stored = window.localStorage.getItem(sessionStorageKey);
-    const trimmed = stored?.trim();
-    return trimmed ? trimmed : null;
-  });
+  const [actor, setActor] = useState<ActorProfile | null>(null);
+  const [status, setStatus] = useState<SessionStatus>("loading");
 
   useEffect(() => {
-    if (activeUsername) {
-      window.localStorage.setItem(sessionStorageKey, activeUsername);
-    } else {
-      window.localStorage.removeItem(sessionStorageKey);
+    let cancelled = false;
+
+    async function load() {
+      try {
+        const current = await getSession();
+        if (!cancelled) {
+          setActor(current);
+          setStatus("authenticated");
+        }
+      } catch {
+        if (!cancelled) {
+          setActor(null);
+          setStatus("anonymous");
+        }
+      }
     }
-  }, [activeUsername]);
 
-  const value: SessionContextValue = {
-    activeUsername,
-    setActiveUsername(username) {
-      const trimmed = username?.trim();
-      setActiveUsernameState(trimmed ? trimmed : null);
-    },
-    signOut() {
-      setActiveUsernameState(null);
-    },
-  };
+    void load();
 
-  return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function signIn(input: { username: string; password: string }) {
+    const current = await login(input);
+    setActor(current);
+    setStatus("authenticated");
+  }
+
+  async function signOut() {
+    await logout();
+    setActor(null);
+    setStatus("anonymous");
+  }
+
+  return (
+    <SessionContext.Provider value={{ actor, status, login: signIn, logout: signOut }}>
+      {children}
+    </SessionContext.Provider>
+  );
 }
 
 function AppShell({
@@ -84,8 +105,14 @@ function AppShell({
   subtitle: string;
   children: ReactNode;
 }) {
-  const { activeUsername, signOut } = useSession();
-  const homeLink = activeUsername ? "/home" : "/login";
+  const navigate = useNavigate();
+  const { actor, status, logout: signOut } = useSession();
+  const homeLink = actor ? "/home" : "/login";
+
+  async function handleSignOut() {
+    await signOut();
+    navigate("/login");
+  }
 
   return (
     <div className="app-shell">
@@ -104,16 +131,21 @@ function AppShell({
         </div>
 
         <div className="topbar-actions">
-          {activeUsername ? (
+          {status === "loading" ? (
+            <div className="session-pill">
+              <span>Session</span>
+              <strong>Checking...</strong>
+            </div>
+          ) : actor ? (
             <>
               <div className="session-pill">
                 <span>Signed in</span>
-                <strong>@{activeUsername}</strong>
+                <strong>@{actor.username}</strong>
               </div>
-              <Link className="secondary-button" to="/login">
-                Switch
+              <Link className="secondary-button" to={profilePath(actor.username)}>
+                Profile
               </Link>
-              <button className="secondary-button" type="button" onClick={signOut}>
+              <button className="secondary-button" type="button" onClick={() => void handleSignOut()}>
                 Sign out
               </button>
             </>
@@ -246,6 +278,20 @@ function Composer({ username, onCreated }: { username: string; onCreated: (post:
 
 function normalizeHandle(handle: string | undefined): string {
   return handle?.startsWith("@") ? handle.slice(1).trim() : handle?.trim() ?? "";
+}
+
+function LoadingPanel({ title, subtitle }: { title: string; subtitle: string }) {
+  return (
+    <AppShell title={title} subtitle={subtitle}>
+      <section className="panel wide-panel">
+        <div className="panel-header">
+          <h2>Loading</h2>
+          <span>please wait</span>
+        </div>
+        <p className="summary">Checking the current session and loading the requested view.</p>
+      </section>
+    </AppShell>
+  );
 }
 
 function TimelinePage({
@@ -387,18 +433,22 @@ function TimelinePage({
 }
 
 function HomePage() {
-  const { activeUsername } = useSession();
+  const { actor, status } = useSession();
 
-  if (!activeUsername) {
+  if (status === "loading") {
+    return <LoadingPanel title="Home timeline" subtitle="Checking the current session." />;
+  }
+
+  if (!actor) {
     return <Navigate replace to="/login" />;
   }
 
   return (
     <TimelinePage
-      username={activeUsername}
+      username={actor.username}
       title="Home timeline"
-      subtitle={`Posts visible from @${activeUsername}.`}
-      composerUsername={activeUsername}
+      subtitle={`Posts visible from @${actor.username}.`}
+      composerUsername={actor.username}
     />
   );
 }
@@ -452,10 +502,7 @@ function PostPage() {
   }, [postId]);
 
   return (
-    <AppShell
-      title="Single post view"
-      subtitle={`Post detail for @${username}.`}
-    >
+    <AppShell title="Single post view" subtitle={`Post detail for @${username}.`}>
       <section className="panel wide-panel">
         <div className="panel-header">
           <h2>Post</h2>
@@ -476,42 +523,47 @@ function PostPage() {
 
 function LoginPage() {
   const navigate = useNavigate();
-  const { activeUsername, setActiveUsername } = useSession();
-  const [username, setUsername] = useState(activeUsername ?? defaultUsername);
-  const [isChecking, setIsChecking] = useState(false);
+  const { actor, status, login: signIn } = useSession();
+  const [username, setUsername] = useState(defaultUsername);
+  const [password, setPassword] = useState("");
+  const [isSigningIn, setIsSigningIn] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const normalized = normalizeHandle(username);
-    if (!normalized) {
-      setError("username is required");
-      return;
-    }
-
-    setIsChecking(true);
+    setIsSigningIn(true);
     setError(null);
 
     try {
-      await getActor(normalized);
-      setActiveUsername(normalized);
+      await signIn({
+        username: normalizeHandle(username),
+        password,
+      });
       navigate("/home");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "failed to sign in");
     } finally {
-      setIsChecking(false);
+      setIsSigningIn(false);
     }
+  }
+
+  if (status === "loading") {
+    return <LoadingPanel title="Sign in" subtitle="Checking the current session." />;
+  }
+
+  if (actor) {
+    return <Navigate replace to="/home" />;
   }
 
   return (
     <AppShell
       title="Sign in"
-      subtitle="Choose the local actor you want to post as. No password is checked."
+      subtitle="Choose the local actor you want to post as. Passwords are managed by the CLI."
     >
       <section className="panel login-panel">
         <div className="panel-header">
           <h2>Login</h2>
-          <span>{activeUsername ? `current: @${activeUsername}` : "no active account"}</span>
+          <span>local session</span>
         </div>
 
         <form className="login-form" onSubmit={submit}>
@@ -526,8 +578,18 @@ function LoginPage() {
             />
           </label>
 
-          <button type="submit" disabled={isChecking}>
-            {isChecking ? "Checking..." : "Continue"}
+          <label>
+            <span>Password</span>
+            <input
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              type="password"
+              autoComplete="current-password"
+            />
+          </label>
+
+          <button type="submit" disabled={isSigningIn}>
+            {isSigningIn ? "Signing in..." : "Continue"}
           </button>
 
           {error ? <p className="error">{error}</p> : null}
@@ -541,14 +603,14 @@ function LoginPage() {
         </div>
 
         <p className="summary">
-          This screen only selects the local actor that the web app uses for posting. It does not
-          authenticate against a password store.
+          This screen validates the username and password against the server, then stores a
+          session cookie. User creation itself happens from the CLI.
         </p>
 
         <ul className="feature-list">
-          <li>Validate the username against the server before saving it.</li>
-          <li>Keep the selection in browser storage so the session survives reloads.</li>
-          <li>Use the selected actor on the home timeline composer.</li>
+          <li>Passwords are set when the user is created or updated from the CLI.</li>
+          <li>The browser only keeps the session cookie, not the password.</li>
+          <li>The home timeline composer uses the signed-in local actor.</li>
         </ul>
 
         <div className="login-note">
@@ -588,9 +650,13 @@ function NotFoundPage() {
 }
 
 function RootRedirect() {
-  const { activeUsername } = useSession();
+  const { actor, status } = useSession();
 
-  return <Navigate replace to={activeUsername ? "/home" : "/login"} />;
+  if (status === "loading") {
+    return <LoadingPanel title="kodamapub" subtitle="Checking the current session." />;
+  }
+
+  return <Navigate replace to={actor ? "/home" : "/login"} />;
 }
 
 export function App() {
