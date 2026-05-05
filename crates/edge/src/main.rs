@@ -40,20 +40,9 @@ impl KodamapubEdge {
     fn route_target(&self, session: &Session) -> RouteTarget {
         let request = session.req_header();
         let path = request.uri.path();
-        let method = request.method.as_str();
 
-        if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") {
+        if path.starts_with("/api/") {
             return RouteTarget::Server;
-        }
-
-        if path == "/health" || path.starts_with("/.well-known/") {
-            return RouteTarget::Server;
-        }
-
-        if path.starts_with("/users/") || path.starts_with("/posts/") {
-            if accepts_json(request) {
-                return RouteTarget::Server;
-            }
         }
 
         RouteTarget::Web
@@ -117,7 +106,9 @@ impl ProxyHttp for KodamapubEdge {
             .get("host")
             .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
         {
-            upstream_request.insert_header("x-forwarded-host", host).ok();
+            upstream_request
+                .insert_header("x-forwarded-host", host)
+                .ok();
         }
 
         Ok(())
@@ -132,7 +123,9 @@ impl ProxyHttp for KodamapubEdge {
             .client_addr()
             .map(|addr| addr.to_string())
             .unwrap_or_else(|| "-".to_string());
-        let error = error.map(ToString::to_string).unwrap_or_else(|| "-".to_string());
+        let error = error
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "-".to_string());
         let target = ctx.target.map_or("unknown", |target| match target {
             RouteTarget::Web => "web",
             RouteTarget::Server => "server",
@@ -151,11 +144,9 @@ impl ProxyHttp for KodamapubEdge {
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
-    )
-    .format_timestamp_secs()
-    .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_secs()
+        .init();
 
     let listen_addr = env::var("EDGE_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
 
@@ -170,12 +161,4 @@ fn main() -> anyhow::Result<()> {
 
     info!("kodamapub-edge started listen_addr={}", listen_addr);
     server.run_forever();
-}
-
-fn accepts_json(request: &RequestHeader) -> bool {
-    request
-        .headers
-        .get("accept")
-        .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
-        .is_some_and(|value| value.contains("application/json"))
 }

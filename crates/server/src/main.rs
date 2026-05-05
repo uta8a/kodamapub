@@ -179,8 +179,7 @@ async fn main() -> anyhow::Result<()> {
         public_base_url,
     });
 
-    let app = Router::new()
-        .route("/health", get(health))
+    let api = Router::new()
         .route("/posts/{post_id}", get(get_post))
         .route("/users/{username}", get(get_user))
         .route(
@@ -188,6 +187,10 @@ async fn main() -> anyhow::Result<()> {
             get(list_user_posts).post(create_user_post),
         )
         .with_state(state);
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .nest("/api", api);
 
     let listener = tokio::net::TcpListener::bind(bind_addr.parse::<SocketAddr>()?).await?;
     axum::serve(listener, app).await?;

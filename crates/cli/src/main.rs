@@ -116,8 +116,7 @@ async fn main() -> anyhow::Result<()> {
 
             println!(
                 "seeded actor {} with {} posts",
-                actor.profile.actor_url,
-                created
+                actor.profile.actor_url, created
             );
         }
     }
