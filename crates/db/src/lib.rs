@@ -233,6 +233,12 @@ pub struct SessionRepository<'a> {
     pool: &'a SqlitePool,
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionRecord {
+    pub actor_id: ActorId,
+    pub csrf_token: String,
+}
+
 impl<'a> RemoteActorRepository<'a> {
     pub async fn upsert(&self, actor: &RemoteActor) -> Result<(), DbError> {
         let mut tx = self.pool.begin().await?;
@@ -359,16 +365,18 @@ impl<'a> SessionRepository<'a> {
         &self,
         token: &str,
         actor_id: ActorId,
+        csrf_token: &str,
         expires_at: DateTime<Utc>,
     ) -> Result<(), DbError> {
         sqlx::query(
             r#"
-            insert into login_sessions (token, actor_id, created_at, expires_at)
-            values ($1, $2, $3, $4)
+            insert into login_sessions (token, actor_id, csrf_token, created_at, expires_at)
+            values ($1, $2, $3, $4, $5)
             "#,
         )
         .bind(token)
         .bind(actor_id.0)
+        .bind(csrf_token)
         .bind(Utc::now())
         .bind(expires_at)
         .execute(self.pool)
@@ -378,9 +386,15 @@ impl<'a> SessionRepository<'a> {
     }
 
     pub async fn find_actor_id(&self, token: &str) -> Result<Option<ActorId>, DbError> {
+        self.find(token)
+            .await
+            .map(|session| session.map(|value| value.actor_id))
+    }
+
+    pub async fn find(&self, token: &str) -> Result<Option<SessionRecord>, DbError> {
         let row = sqlx::query(
             r#"
-            select actor_id, expires_at
+            select actor_id, csrf_token, expires_at
             from login_sessions
             where token = $1
             "#,
@@ -399,7 +413,16 @@ impl<'a> SessionRepository<'a> {
             return Ok(None);
         }
 
-        Ok(Some(ActorId(row.try_get::<Uuid, _>("actor_id")?)))
+        let csrf_token = row.try_get::<String, _>("csrf_token")?;
+        if csrf_token.is_empty() {
+            self.delete(token).await?;
+            return Ok(None);
+        }
+
+        Ok(Some(SessionRecord {
+            actor_id: ActorId(row.try_get::<Uuid, _>("actor_id")?),
+            csrf_token,
+        }))
     }
 
     pub async fn delete(&self, token: &str) -> Result<(), DbError> {

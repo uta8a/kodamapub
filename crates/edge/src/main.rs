@@ -81,7 +81,15 @@ impl ProxyHttp for KodamapubEdge {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         upstream_request
-            .insert_header("x-forwarded-proto", "http")
+            .insert_header(
+                "x-forwarded-proto",
+                session
+                    .req_header()
+                    .headers
+                    .get("x-forwarded-proto")
+                    .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
+                    .unwrap_or("http"),
+            )
             .ok();
 
         upstream_request
@@ -108,6 +116,12 @@ impl ProxyHttp for KodamapubEdge {
         {
             upstream_request
                 .insert_header("x-forwarded-host", host)
+                .ok();
+        }
+
+        if let Some(client_addr) = session.client_addr() {
+            upstream_request
+                .insert_header("x-forwarded-for", client_addr.to_string())
                 .ok();
         }
 

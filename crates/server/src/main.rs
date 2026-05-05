@@ -1,11 +1,16 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use chrono::{Duration as ChronoDuration, Utc};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -22,6 +27,9 @@ use kodamapub_domain::{
 };
 use kodamapub_job::{JobError, RetryPolicy, enqueue_create_deliveries};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+use tower::ServiceBuilder;
+use tower_http::set_header::SetResponseHeaderLayer;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -29,6 +37,7 @@ struct AppState {
     db: Database,
     public_base_url: PublicBaseUrl,
     remote_client: reqwest::Client,
+    rate_limiter: RateLimiter,
 }
 
 const MAX_INBOX_BODY_BYTES: usize = 1_048_576;
@@ -82,6 +91,12 @@ struct HealthResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct SessionResponse {
+    actor: kodamapub_domain::ActorProfile,
+    csrf_token: String,
+}
+
+#[derive(Debug, Serialize)]
 struct PostPageResponse {
     posts: Vec<Post>,
     next_cursor: Option<PostId>,
@@ -92,11 +107,61 @@ struct ServerConfig {
     public_base_url: PublicBaseUrl,
 }
 
+#[derive(Clone)]
+struct RateLimiter {
+    buckets: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
+}
+
+#[derive(Clone, Copy)]
+struct RateLimitSpec {
+    limit: usize,
+    window: Duration,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            buckets: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    async fn check(&self, key: String, spec: RateLimitSpec) -> Result<(), ApiError> {
+        let now = Instant::now();
+        let mut buckets = self.buckets.lock().await;
+        let bucket = buckets.entry(key).or_default();
+
+        while bucket
+            .front()
+            .is_some_and(|timestamp| now.duration_since(*timestamp) >= spec.window)
+        {
+            bucket.pop_front();
+        }
+
+        if bucket.len() >= spec.limit {
+            let retry_after = bucket
+                .front()
+                .map(|timestamp| spec.window.saturating_sub(now.duration_since(*timestamp)))
+                .unwrap_or(spec.window);
+            return Err(ApiError::TooManyRequests {
+                message: "too many requests".to_string(),
+                retry_after: Some(retry_after),
+            });
+        }
+
+        bucket.push_back(now);
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 enum ApiError {
     NotFound(&'static str),
     Unauthorized(&'static str),
     Forbidden(&'static str),
+    TooManyRequests {
+        message: String,
+        retry_after: Option<Duration>,
+    },
     #[allow(dead_code)]
     BadRequest(String),
     Internal(anyhow::Error),
@@ -149,6 +214,22 @@ impl IntoResponse for ApiError {
                 (StatusCode::UNAUTHORIZED, message).into_response()
             }
             ApiError::Forbidden(message) => (StatusCode::FORBIDDEN, message).into_response(),
+            ApiError::TooManyRequests {
+                message,
+                retry_after,
+            } => {
+                let mut response = (StatusCode::TOO_MANY_REQUESTS, message).into_response();
+                if let Some(retry_after) = retry_after {
+                    if let Ok(value) =
+                        HeaderValue::from_str(&retry_after.as_secs().max(1).to_string())
+                    {
+                        response
+                            .headers_mut()
+                            .insert(header::RETRY_AFTER, value);
+                    }
+                }
+                response
+            }
             ApiError::BadRequest(message) => (StatusCode::BAD_REQUEST, message).into_response(),
             ApiError::Internal(error) => {
                 tracing::error!(error = %error, "request failed");
@@ -178,9 +259,32 @@ fn build_app(state: Arc<AppState>, config: ServerConfig) -> Router {
         )
         .with_state((state.clone(), config.clone()));
 
+    let security_headers = ServiceBuilder::new()
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("same-origin"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("permissions-policy"),
+            HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+        ));
+
     Router::new()
         .route("/health", get(health))
         .nest("/api", api)
+        .layer(security_headers)
         .with_state((state, config))
 }
 
@@ -213,10 +317,23 @@ async fn create_user_post(
     headers: HeaderMap,
     Json(request): Json<CreatePostRequest>,
 ) -> Result<(StatusCode, Json<Post>), ApiError> {
-    let session_actor = require_session_actor(&state, &headers).await?;
+    let session = require_authenticated_session(&state, &headers).await?;
+    let session_actor = find_local_actor_by_id(&state, session.actor_id).await?;
     if session_actor.profile.username != path.username {
         return Err(ApiError::Forbidden("cannot post as another user"));
     }
+    ensure_same_origin(&headers, &state.public_base_url)?;
+    state
+        .rate_limiter
+        .check(
+            format!("create-post:{}:{}", client_rate_key(&headers), path.username),
+            RateLimitSpec {
+                limit: 60,
+                window: Duration::from_secs(60),
+            },
+        )
+        .await?;
+    ensure_csrf_token(&headers, &session.csrf_token)?;
 
     let actor = state
         .db
@@ -362,8 +479,19 @@ async fn get_outbox(
 
 async fn get_webfinger(
     State((state, config)): State<(Arc<AppState>, ServerConfig)>,
+    headers: HeaderMap,
     Query(query): Query<WebFingerQuery>,
 ) -> Result<Response, ApiError> {
+    state
+        .rate_limiter
+        .check(
+            format!("webfinger:{}", client_rate_key(&headers)),
+            RateLimitSpec {
+                limit: 60,
+                window: Duration::from_secs(60),
+            },
+        )
+        .await?;
     let parsed = parse_webfinger_resource(&config.public_base_url, &query.resource)
         .ok_or_else(|| ApiError::BadRequest("invalid webfinger resource".to_string()))?;
     let actor = state
@@ -378,8 +506,21 @@ async fn get_webfinger(
 
 async fn post_login(
     State((state, _config)): State<(Arc<AppState>, ServerConfig)>,
+    headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
+    ensure_same_origin(&headers, &state.public_base_url)?;
+    state
+        .rate_limiter
+        .check(
+            format!("login:{}:{}", client_rate_key(&headers), request.username),
+            RateLimitSpec {
+                limit: 10,
+                window: Duration::from_secs(300),
+            },
+        )
+        .await?;
+
     let actor = state
         .db
         .local_actors()
@@ -400,16 +541,18 @@ async fn post_login(
     }
 
     let token = Uuid::now_v7().to_string();
+    let csrf_token = Uuid::now_v7().to_string();
     let expires_at = Utc::now() + ChronoDuration::days(30);
     state
         .db
         .sessions()
-        .create(&token, actor.id(), expires_at)
+        .create(&token, actor.id(), &csrf_token, expires_at)
         .await?;
 
     let secure = state.public_base_url.as_str().starts_with("https://");
     session_response(
         actor.profile,
+        csrf_token,
         Some(build_session_cookie(&token, expires_at, secure)?),
     )
 }
@@ -418,8 +561,9 @@ async fn get_session(
     State((state, _config)): State<(Arc<AppState>, ServerConfig)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let actor = require_session_actor(&state, &headers).await?;
-    session_response(actor.profile, None)
+    let session = require_authenticated_session(&state, &headers).await?;
+    let actor = find_local_actor_by_id(&state, session.actor_id).await?;
+    session_response(actor.profile, session.csrf_token, None)
 }
 
 async fn post_logout(
@@ -427,7 +571,11 @@ async fn post_logout(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     if let Some(token) = session_token_from_headers(&headers) {
-        state.db.sessions().delete(&token).await?;
+        if let Some(session) = state.db.sessions().find(&token).await? {
+            ensure_same_origin(&headers, &state.public_base_url)?;
+            ensure_csrf_token(&headers, &session.csrf_token)?;
+            state.db.sessions().delete(&token).await?;
+        }
     }
 
     let mut response = Response::new(Body::empty());
@@ -441,22 +589,17 @@ async fn post_logout(
     Ok(response)
 }
 
-async fn require_session_actor(
+async fn require_authenticated_session(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<kodamapub_domain::LocalActor, ApiError> {
+) -> Result<kodamapub_db::SessionRecord, ApiError> {
     let token = session_token_from_headers(headers)
         .ok_or(ApiError::Unauthorized("session is required"))?;
-    let Some(actor_id) = state.db.sessions().find_actor_id(&token).await? else {
+    let Some(session) = state.db.sessions().find(&token).await? else {
         return Err(ApiError::Unauthorized("session is required"));
     };
 
-    state
-        .db
-        .local_actors()
-        .find_by_id(actor_id)
-        .await?
-        .ok_or(ApiError::Unauthorized("session is required"))
+    Ok(session)
 }
 
 fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
@@ -469,8 +612,12 @@ fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
     })
 }
 
-fn session_response(actor: kodamapub_domain::ActorProfile, cookie: Option<String>) -> Result<Response, ApiError> {
-    let mut response = Json(actor).into_response();
+fn session_response(
+    actor: kodamapub_domain::ActorProfile,
+    csrf_token: String,
+    cookie: Option<String>,
+) -> Result<Response, ApiError> {
+    let mut response = Json(SessionResponse { actor, csrf_token }).into_response();
     if let Some(cookie) = cookie {
         response.headers_mut().insert(
             header::SET_COOKIE,
@@ -493,6 +640,55 @@ fn build_session_cookie(
     ))
 }
 
+fn ensure_csrf_token(headers: &HeaderMap, expected: &str) -> Result<(), ApiError> {
+    let provided = headers
+        .get("x-csrf-token")
+        .and_then(|value| value.to_str().ok())
+        .ok_or(ApiError::Forbidden("csrf token is required"))?;
+
+    if provided != expected {
+        return Err(ApiError::Forbidden("csrf token is invalid"));
+    }
+
+    Ok(())
+}
+
+fn ensure_same_origin(headers: &HeaderMap, public_base_url: &PublicBaseUrl) -> Result<(), ApiError> {
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|value| value.to_str().ok()) else {
+        return Err(ApiError::Forbidden("origin is required"));
+    };
+
+    if !same_origin(origin, public_base_url.as_str()) {
+        return Err(ApiError::Forbidden("origin is not allowed"));
+    }
+
+    Ok(())
+}
+
+fn same_origin(candidate: &str, expected: &str) -> bool {
+    let Ok(candidate) = url::Url::parse(candidate) else {
+        return false;
+    };
+    let Ok(expected) = url::Url::parse(expected) else {
+        return false;
+    };
+
+    candidate.scheme() == expected.scheme()
+        && candidate.host_str() == expected.host_str()
+        && candidate.port_or_known_default() == expected.port_or_known_default()
+}
+
+fn client_rate_key(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
 fn clear_session_cookie(secure: bool) -> String {
     let secure_flag = if secure { "; Secure" } else { "" };
     format!(
@@ -508,6 +704,17 @@ async fn post_inbox(
     uri: Uri,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
+    state
+        .rate_limiter
+        .check(
+            format!("inbox:{}:{}", client_rate_key(&headers), path.username),
+            RateLimitSpec {
+                limit: 120,
+                window: Duration::from_secs(60),
+            },
+        )
+        .await?;
+
     let local_actor = state
         .db
         .local_actors()
@@ -659,6 +866,7 @@ async fn main() -> anyhow::Result<()> {
         db,
         public_base_url,
         remote_client: reqwest::Client::new(),
+        rate_limiter: RateLimiter::new(),
     });
     let config = ServerConfig {
         public_base_url: state.public_base_url.clone(),
@@ -868,6 +1076,7 @@ mod tests {
             db,
             public_base_url: "https://example.invalid".parse().expect("public base url"),
             remote_client: reqwest::Client::new(),
+            rate_limiter: RateLimiter::new(),
         });
 
         build_app(
