@@ -1,10 +1,10 @@
-import type { ActorProfile, CreatePostInput, Post } from './types';
+import type { ActorProfile, CreatePostInput, Post, PostPage } from "./types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     headers: {
-      'content-type': 'application/json',
-      accept: 'application/json',
+      "content-type": "application/json",
+      accept: "application/json",
       ...(init?.headers ?? {}),
     },
     ...init,
@@ -21,8 +21,17 @@ export async function getActor(username: string): Promise<ActorProfile> {
   return request(`/api/users/${encodeURIComponent(username)}`);
 }
 
-export async function listPosts(username: string, limit = 20): Promise<Post[]> {
-  return request(`/api/users/${encodeURIComponent(username)}/posts?limit=${limit}`);
+export async function listPosts(
+  username: string,
+  options?: { limit?: number; before?: string | null },
+): Promise<PostPage> {
+  const params = new URLSearchParams();
+  params.set("limit", String(options?.limit ?? 20));
+  if (options?.before) {
+    params.set("before", options.before);
+  }
+
+  return request(`/api/users/${encodeURIComponent(username)}/posts?${params.toString()}`);
 }
 
 export async function getPost(postId: string): Promise<Post> {
@@ -31,7 +40,7 @@ export async function getPost(postId: string): Promise<Post> {
 
 export async function createPost(username: string, input: CreatePostInput): Promise<Post> {
   return request(`/api/users/${encodeURIComponent(username)}/posts`, {
-    method: 'POST',
+    method: "POST",
     body: JSON.stringify(input),
   });
 }

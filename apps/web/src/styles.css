@@ -260,6 +260,27 @@ select {
   transform: none;
 }
 
+.feed-actions {
+  display: flex;
+  justify-content: center;
+  margin-top: 18px;
+}
+
+.feed-actions button {
+  border: 1px solid rgba(59, 46, 30, 0.16);
+  border-radius: 999px;
+  padding: 12px 18px;
+  background: rgba(255, 255, 255, 0.88);
+  color: var(--accent-strong);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.feed-actions button:disabled {
+  cursor: progress;
+  opacity: 0.75;
+}
+
 .feed-list {
   display: grid;
   gap: 14px;

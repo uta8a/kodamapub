@@ -1,21 +1,14 @@
-import { type FormEvent, type ReactNode, useEffect, useMemo, useState } from 'react';
-import {
-  Link,
-  Navigate,
-  Route,
-  Routes,
-  useNavigate,
-  useParams,
-} from 'react-router-dom';
-import { createPost, getActor, getPost, listPosts } from './api';
-import type { ActorProfile, Post } from './types';
+import { type FormEvent, type ReactNode, useEffect, useMemo, useState } from "react";
+import { Link, Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
+import { createPost, getActor, getPost, listPosts } from "./api";
+import type { ActorProfile, Post } from "./types";
 
-const defaultUsername = import.meta.env.VITE_DEFAULT_USERNAME ?? 'alice';
+const defaultUsername = import.meta.env.VITE_DEFAULT_USERNAME ?? "alice";
 
 function formatDate(value: string): string {
-  return new Intl.DateTimeFormat('ja-JP', {
-    dateStyle: 'medium',
-    timeStyle: 'short',
+  return new Intl.DateTimeFormat("ja-JP", {
+    dateStyle: "medium",
+    timeStyle: "short",
   }).format(new Date(value));
 }
 
@@ -69,18 +62,12 @@ function FeedCard({ post }: { post: Post }) {
   );
 }
 
-function Composer({
-  username,
-  onCreated,
-}: {
-  username: string;
-  onCreated: (post: Post) => void;
-}) {
+function Composer({ username, onCreated }: { username: string; onCreated: (post: Post) => void }) {
   const navigate = useNavigate();
-  const [contentSource, setContentSource] = useState('Hello, world.');
-  const [visibility, setVisibility] = useState<Post['visibility']>('Public');
-  const [contentFormat, setContentFormat] = useState<Post['content_format']>('Plaintext');
-  const [replyTo, setReplyTo] = useState('');
+  const [contentSource, setContentSource] = useState("Hello, world.");
+  const [visibility, setVisibility] = useState<Post["visibility"]>("Public");
+  const [contentFormat, setContentFormat] = useState<Post["content_format"]>("Plaintext");
+  const [replyTo, setReplyTo] = useState("");
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -97,11 +84,11 @@ function Composer({
         in_reply_to: replyTo.trim() ? replyTo.trim() : null,
       });
       onCreated(post);
-      setContentSource('');
-      setReplyTo('');
+      setContentSource("");
+      setReplyTo("");
       navigate(`/posts/${post.id}`);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'failed to create post');
+      setError(cause instanceof Error ? cause.message : "failed to create post");
     } finally {
       setIsSaving(false);
     }
@@ -130,7 +117,7 @@ function Composer({
             <span>Format</span>
             <select
               value={contentFormat}
-              onChange={(event) => setContentFormat(event.target.value as Post['content_format'])}
+              onChange={(event) => setContentFormat(event.target.value as Post["content_format"])}
             >
               <option value="Plaintext">Plaintext</option>
               <option value="Markdown">Markdown</option>
@@ -141,7 +128,7 @@ function Composer({
             <span>Visibility</span>
             <select
               value={visibility}
-              onChange={(event) => setVisibility(event.target.value as Post['visibility'])}
+              onChange={(event) => setVisibility(event.target.value as Post["visibility"])}
             >
               <option value="Public">Public</option>
               <option value="Unlisted">Unlisted</option>
@@ -161,7 +148,7 @@ function Composer({
         </label>
 
         <button type="submit" disabled={isSaving}>
-          {isSaving ? 'Publishing...' : 'Publish'}
+          {isSaving ? "Publishing..." : "Publish"}
         </button>
 
         {error ? <p className="error">{error}</p> : null}
@@ -172,10 +159,12 @@ function Composer({
 
 function UserPage() {
   const { handle } = useParams();
-  const username = handle?.startsWith('@') ? handle.slice(1) : handle ?? defaultUsername;
+  const username = handle?.startsWith("@") ? handle.slice(1) : (handle ?? defaultUsername);
   const [actor, setActor] = useState<ActorProfile | null>(null);
   const [posts, setPosts] = useState<Post[]>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -184,16 +173,18 @@ function UserPage() {
       setError(null);
       setActor(null);
       setPosts([]);
+      setNextCursor(null);
       try {
-        const [actorData, postData] = await Promise.all([getActor(username), listPosts(username)]);
+        const [actorData, postPage] = await Promise.all([getActor(username), listPosts(username)]);
         if (cancelled) {
           return;
         }
         setActor(actorData);
-        setPosts(postData);
+        setPosts(postPage.posts);
+        setNextCursor(postPage.next_cursor);
       } catch (cause) {
         if (!cancelled) {
-          setError(cause instanceof Error ? cause.message : 'failed to load timeline');
+          setError(cause instanceof Error ? cause.message : "failed to load timeline");
         }
       }
     }
@@ -205,6 +196,25 @@ function UserPage() {
     };
   }, [username]);
 
+  async function loadMore() {
+    if (!nextCursor) {
+      return;
+    }
+
+    setIsLoadingMore(true);
+    setError(null);
+
+    try {
+      const page = await listPosts(username, { before: nextCursor });
+      setPosts((current) => [...current, ...page.posts]);
+      setNextCursor(page.next_cursor);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "failed to load more posts");
+    } finally {
+      setIsLoadingMore(false);
+    }
+  }
+
   return (
     <AppShell
       title={`Timeline for @${username}`}
@@ -213,7 +223,7 @@ function UserPage() {
       <section className="panel profile-panel">
         <div className="panel-header">
           <h2>Profile</h2>
-          <span>{actor?.actor_url ?? 'loading...'}</span>
+          <span>{actor?.actor_url ?? "loading..."}</span>
         </div>
 
         {error ? (
@@ -222,7 +232,7 @@ function UserPage() {
           <>
             <h1>{actor.display_name}</h1>
             <p className="handle">@{actor.username}</p>
-            <p className="summary">{actor.summary ?? 'No summary yet.'}</p>
+            <p className="summary">{actor.summary ?? "No summary yet."}</p>
             <dl className="profile-grid">
               <div>
                 <dt>Actor</dt>
@@ -232,11 +242,11 @@ function UserPage() {
               </div>
               <div>
                 <dt>Inbox</dt>
-                <dd>{actor.inbox_url ?? 'unset'}</dd>
+                <dd>{actor.inbox_url ?? "unset"}</dd>
               </div>
               <div>
                 <dt>Outbox</dt>
-                <dd>{actor.outbox_url ?? 'unset'}</dd>
+                <dd>{actor.outbox_url ?? "unset"}</dd>
               </div>
             </dl>
           </>
@@ -265,13 +275,21 @@ function UserPage() {
             posts.map((post) => <FeedCard key={post.id} post={post} />)
           )}
         </div>
+
+        {nextCursor ? (
+          <div className="feed-actions">
+            <button type="button" onClick={() => void loadMore()} disabled={isLoadingMore}>
+              {isLoadingMore ? "Loading..." : "Load more"}
+            </button>
+          </div>
+        ) : null}
       </section>
     </AppShell>
   );
 }
 
 function PostPage() {
-  const { postId = '' } = useParams();
+  const { postId = "" } = useParams();
   const [post, setPost] = useState<Post | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -288,7 +306,7 @@ function PostPage() {
         }
       } catch (cause) {
         if (!cancelled) {
-          setError(cause instanceof Error ? cause.message : 'failed to load post');
+          setError(cause instanceof Error ? cause.message : "failed to load post");
         }
       }
     }
@@ -301,7 +319,10 @@ function PostPage() {
   }, [postId]);
 
   return (
-    <AppShell title="Single post view" subtitle="Useful for phase 1 verification and later federation.">
+    <AppShell
+      title="Single post view"
+      subtitle="Useful for phase 1 verification and later federation."
+    >
       <section className="panel wide-panel">
         <div className="panel-header">
           <h2>Post</h2>

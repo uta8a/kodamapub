@@ -1,21 +1,20 @@
-import { serve } from '@hono/node-server';
-import { serveStatic } from '@hono/node-server/serve-static';
-import { Hono } from 'hono';
+import { serve } from "@hono/node-server";
+import { serveStatic } from "@hono/node-server/serve-static";
+import { Hono } from "hono";
 
 const app = new Hono();
-const apiOrigin = process.env.API_ORIGIN ?? 'http://server:3000';
-const port = Number(process.env.PORT ?? '5173');
+const apiOrigin = process.env.API_ORIGIN ?? "http://server:3000";
+const port = Number(process.env.PORT ?? "5173");
+
+function wantsActivityPub(request: Request): boolean {
+  const accept = request.headers.get("accept") ?? "";
+  return accept.includes("application/activity+json") || accept.includes("application/ld+json");
+}
 
 function copyProxyHeaders(upstream: Response): Headers {
   const headers = new Headers();
 
-  for (const name of [
-    'content-type',
-    'cache-control',
-    'etag',
-    'last-modified',
-    'content-length',
-  ]) {
+  for (const name of ["content-type", "cache-control", "etag", "last-modified", "content-length"]) {
     const value = upstream.headers.get(name);
     if (value) {
       headers.set(name, value);
@@ -29,11 +28,11 @@ async function proxyToApi(request: Request, path: string): Promise<Response> {
   const upstream = await fetch(`${apiOrigin}${path}`, {
     method: request.method,
     headers: {
-      accept: request.headers.get('accept') ?? 'application/json',
-      'content-type': request.headers.get('content-type') ?? 'application/json',
+      accept: request.headers.get("accept") ?? "application/json",
+      "content-type": request.headers.get("content-type") ?? "application/json",
     },
     body:
-      request.method === 'GET' || request.method === 'HEAD'
+      request.method === "GET" || request.method === "HEAD"
         ? undefined
         : await request.arrayBuffer(),
   });
@@ -44,28 +43,49 @@ async function proxyToApi(request: Request, path: string): Promise<Response> {
   });
 }
 
-app.get('/health', (c) => c.json({ status: 'ok', service: 'web' }));
+app.get("/health", (c) => c.json({ status: "ok", service: "web" }));
 
-app.on(['GET', 'POST'], '/users/:username/posts', async (c) => {
-  const username = encodeURIComponent(c.req.param('username'));
-  const query = c.req.url.includes('?') ? c.req.url.slice(c.req.url.indexOf('?')) : '';
+app.get("/.well-known/webfinger", (c) => {
+  const search = new URL(c.req.url).search;
+  return proxyToApi(c.req.raw, `/api/.well-known/webfinger${search}`);
+});
+
+app.on(["GET", "POST"], "/users/:username/posts", async (c) => {
+  const username = encodeURIComponent(c.req.param("username"));
+  const query = c.req.url.includes("?") ? c.req.url.slice(c.req.url.indexOf("?")) : "";
   return proxyToApi(c.req.raw, `/api/users/${username}/posts${query}`);
 });
 
-app.get('/users/:username', async (c) => {
-  const username = encodeURIComponent(c.req.param('username'));
+app.get("/users/:username/outbox", async (c) => {
+  const username = encodeURIComponent(c.req.param("username"));
+  const query = c.req.url.includes("?") ? c.req.url.slice(c.req.url.indexOf("?")) : "";
+  return proxyToApi(c.req.raw, `/api/users/${username}/outbox${query}`);
+});
+
+app.get("/users/:username", async (c) => {
+  const username = encodeURIComponent(c.req.param("username"));
   return proxyToApi(c.req.raw, `/api/users/${username}`);
 });
 
+app.get("/posts/:postId", async (c, next) => {
+  if (!wantsActivityPub(c.req.raw)) {
+    await next();
+    return;
+  }
+
+  const postId = encodeURIComponent(c.req.param("postId"));
+  return proxyToApi(c.req.raw, `/api/posts/${postId}`);
+});
+
 app.use(
-  '/assets/*',
+  "/assets/*",
   serveStatic({
-    root: './dist',
+    root: "./dist",
   }),
 );
 
-app.get('/favicon.ico', serveStatic({ path: './dist/favicon.ico' }));
-app.get('*', serveStatic({ path: './dist/index.html' }));
+app.get("/favicon.ico", serveStatic({ path: "./dist/favicon.ico" }));
+app.get("*", serveStatic({ path: "./dist/index.html" }));
 
 serve({
   fetch: app.fetch,
