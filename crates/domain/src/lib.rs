@@ -40,7 +40,11 @@ pub enum ContentFormat {
     Markdown,
 }
 
-fn validate_nonempty_string(value: &str, max_len: usize, label: &'static str) -> Result<String, TextValueError> {
+fn validate_nonempty_string(
+    value: &str,
+    max_len: usize,
+    label: &'static str,
+) -> Result<String, TextValueError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(TextValueError::Empty(label));
@@ -223,7 +227,11 @@ impl FromStr for ContentSource {
     type Err = TextValueError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self(validate_nonempty_string(value, 10000, "content_source")?))
+        Ok(Self(validate_nonempty_string(
+            value,
+            10000,
+            "content_source",
+        )?))
     }
 }
 
@@ -407,7 +415,9 @@ pub fn render_content(source: &ContentSource, format: &ContentFormat) -> String 
     match format {
         // For the first implementation, keep rendering conservative and safe.
         // Markdown support can become richer later without changing the model.
-        ContentFormat::Plaintext | ContentFormat::Markdown => render_plaintext_like(source.as_str()),
+        ContentFormat::Plaintext | ContentFormat::Markdown => {
+            render_plaintext_like(source.as_str())
+        }
     }
 }
 
@@ -524,7 +534,9 @@ mod tests {
 
     #[test]
     fn display_name_rejects_empty_value() {
-        let error = "   ".parse::<DisplayName>().expect_err("reject display name");
+        let error = "   "
+            .parse::<DisplayName>()
+            .expect_err("reject display name");
         assert_eq!(error, TextValueError::Empty("display_name"));
     }
 

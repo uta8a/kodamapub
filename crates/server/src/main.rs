@@ -1,11 +1,11 @@
 use std::{net::SocketAddr, str::FromStr, sync::Arc};
 
 use axum::{
+    Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
-    Json, Router,
 };
 use kodamapub_db::{Database, DbError};
 use kodamapub_domain::{
@@ -73,11 +73,7 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(message) => (StatusCode::BAD_REQUEST, message).into_response(),
             ApiError::Internal(error) => {
                 tracing::error!(error = %error, "request failed");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error",
-                )
-                    .into_response()
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
             }
         }
     }
@@ -172,8 +168,7 @@ async fn main() -> anyhow::Result<()> {
     let public_base_url = std::env::var("PUBLIC_BASE_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string())
         .parse()?;
-    let bind_addr =
-        std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
 
     let db = Database::connect(&database_url).await?;
     db.migrate().await?;

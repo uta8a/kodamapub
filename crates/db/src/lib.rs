@@ -1,9 +1,9 @@
 use chrono::{DateTime, Utc};
 use kodamapub_domain::{
     ActorId, ActorProfile, ContentFormat, LocalActor, Post, PostId, RemoteActor, Summary,
-    Username, UsernameError, Visibility, TextValueError,
+    TextValueError, Username, UsernameError, Visibility,
 };
-use sqlx::{migrate::Migrator, Row, SqlitePool};
+use sqlx::{Row, SqlitePool, migrate::Migrator};
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
@@ -89,7 +89,10 @@ impl<'a> LocalActorRepository<'a> {
         Ok(())
     }
 
-    pub async fn find_by_username(&self, username: &Username) -> Result<Option<LocalActor>, DbError> {
+    pub async fn find_by_username(
+        &self,
+        username: &Username,
+    ) -> Result<Option<LocalActor>, DbError> {
         let row = sqlx::query(
             r#"
             select
@@ -312,9 +315,7 @@ fn post_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Post, DbError> {
         content_format,
         content_html: row.try_get("content_html")?,
         visibility,
-        in_reply_to: row
-            .try_get::<Option<Uuid>, _>("in_reply_to")?
-            .map(PostId),
+        in_reply_to: row.try_get::<Option<Uuid>, _>("in_reply_to")?.map(PostId),
         created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
     })
 }
@@ -417,10 +418,7 @@ mod tests {
                 Some("local actor".parse().expect("summary")),
                 Url::parse("https://example.invalid/users/alice").expect("actor url"),
                 Some(Url::parse("https://example.invalid/users/alice/inbox").expect("inbox url")),
-                Some(
-                    Url::parse("https://example.invalid/users/alice/outbox")
-                        .expect("outbox url"),
-                ),
+                Some(Url::parse("https://example.invalid/users/alice/outbox").expect("outbox url")),
             ),
             public_key_pem: "PUBLIC KEY".to_string(),
             private_key_pem: "PRIVATE KEY".to_string(),

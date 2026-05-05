@@ -1,8 +1,6 @@
 use clap::{Parser, Subcommand};
-use kodamapub_domain::{
-    ActorProfile, DisplayName, LocalActor, PublicBaseUrl, Summary, Username,
-};
 use kodamapub_db::Database;
+use kodamapub_domain::{ActorProfile, DisplayName, LocalActor, PublicBaseUrl, Summary, Username};
 use url::Url;
 
 #[derive(Debug, Parser)]
