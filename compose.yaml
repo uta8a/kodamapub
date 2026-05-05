@@ -46,22 +46,16 @@ services:
     build:
       context: .
       dockerfile: scripts/docker/web.Dockerfile
-    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "5173"]
     environment:
-      VITE_API_TARGET: http://edge:8080
-      VITE_DEFAULT_USERNAME: alice
+      API_ORIGIN: http://server:3000
+      PORT: "5173"
     depends_on:
       - server
     expose:
       - "5173"
-    volumes:
-      - ./:/workspace
-      - web-node-modules:/workspace/apps/web/node_modules
-    working_dir: /workspace/apps/web
 
 volumes:
   cargo-git:
   cargo-registry:
   cargo-target:
   server-data:
-  web-node-modules:
