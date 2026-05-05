@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, str::FromStr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -13,7 +13,6 @@ use kodamapub_domain::{
     Visibility,
 };
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
@@ -39,6 +38,11 @@ struct UsernamePath {
     username: Username,
 }
 
+#[derive(Debug, Deserialize)]
+struct PostIdPath {
+    post_id: PostId,
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -47,6 +51,7 @@ struct HealthResponse {
 #[derive(Debug)]
 enum ApiError {
     NotFound(&'static str),
+    #[allow(dead_code)]
     BadRequest(String),
     Internal(anyhow::Error),
 }
@@ -142,16 +147,12 @@ async fn create_user_post(
 
 async fn get_post(
     State(state): State<Arc<AppState>>,
-    Path(post_id): Path<String>,
+    Path(path): Path<PostIdPath>,
 ) -> Result<Json<Post>, ApiError> {
-    let id = Uuid::from_str(&post_id)
-        .map(PostId)
-        .map_err(|error| ApiError::BadRequest(format!("invalid post id: {error}")))?;
-
     let post = state
         .db
         .posts()
-        .find(id)
+        .find(path.post_id)
         .await?
         .ok_or(ApiError::NotFound("post not found"))?;
 
@@ -180,10 +181,10 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/posts/:post_id", get(get_post))
-        .route("/users/:username", get(get_user))
+        .route("/posts/{post_id}", get(get_post))
+        .route("/users/{username}", get(get_user))
         .route(
-            "/users/:username/posts",
+            "/users/{username}/posts",
             get(list_user_posts).post(create_user_post),
         )
         .with_state(state);

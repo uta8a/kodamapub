@@ -26,6 +26,29 @@ impl PostId {
     }
 }
 
+impl fmt::Display for PostId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for PostId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let uuid = Uuid::parse_str(value)?;
+        Ok(Self(uuid))
+    }
+}
+
+impl TryFrom<String> for PostId {
+    type Error = uuid::Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Visibility {
     Public,
