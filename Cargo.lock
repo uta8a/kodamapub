@@ -1895,6 +1895,7 @@ dependencies = [
  "kodamapub-domain",
  "kodamapub-job",
  "kodamapub-media",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

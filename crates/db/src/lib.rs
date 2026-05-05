@@ -51,6 +51,10 @@ impl Database {
         DeliveryJobRepository { pool: &self.pool }
     }
 
+    pub fn inbox_dedup(&self) -> InboxDedupRepository<'_> {
+        InboxDedupRepository { pool: &self.pool }
+    }
+
     pub fn posts(&self) -> PostRepository<'_> {
         PostRepository { pool: &self.pool }
     }
@@ -241,6 +245,10 @@ pub struct DeliveryJobRepository<'a> {
     pool: &'a SqlitePool,
 }
 
+pub struct InboxDedupRepository<'a> {
+    pool: &'a SqlitePool,
+}
+
 pub struct PostPage {
     pub posts: Vec<Post>,
     pub next_cursor: Option<PostId>,
@@ -286,6 +294,55 @@ impl<'a> PostRepository<'a> {
         .await?;
 
         row.map(post_from_row).transpose()
+    }
+
+    pub async fn find_by_url(&self, url: &Url) -> Result<Option<Post>, DbError> {
+        let row = sqlx::query(
+            r#"
+            select
+                id, actor_id, url, content_source, content_format,
+                content_html, visibility, in_reply_to, created_at
+            from posts
+            where url = $1
+            "#,
+        )
+        .bind(url.as_str())
+        .fetch_optional(self.pool)
+        .await?;
+
+        row.map(post_from_row).transpose()
+    }
+
+    pub async fn upsert_remote(&self, post: &Post) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            insert into posts (
+                id, actor_id, url, content_source, content_format, content_html,
+                visibility, in_reply_to, created_at
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            on conflict (url) do update set
+                actor_id = excluded.actor_id,
+                content_source = excluded.content_source,
+                content_format = excluded.content_format,
+                content_html = excluded.content_html,
+                visibility = excluded.visibility,
+                in_reply_to = excluded.in_reply_to,
+                created_at = excluded.created_at
+            "#,
+        )
+        .bind(post.id.0)
+        .bind(post.actor_id.0)
+        .bind(post.url.as_str())
+        .bind(post.content_source.as_str())
+        .bind(content_format_to_db(&post.content_format))
+        .bind(&post.content_html)
+        .bind(visibility_to_db(&post.visibility))
+        .bind(post.in_reply_to.as_ref().map(|id| id.0))
+        .bind(post.created_at)
+        .execute(self.pool)
+        .await?;
+
+        Ok(())
     }
 
     pub async fn list_by_actor(
@@ -707,6 +764,31 @@ impl<'a> DeliveryJobRepository<'a> {
     }
 }
 
+impl<'a> InboxDedupRepository<'a> {
+    pub async fn record(
+        &self,
+        activity_id: &str,
+        actor_id: ActorId,
+        activity_type: &str,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            r#"
+            insert into inbox_dedup (activity_id, actor_id, activity_type, received_at)
+            values ($1, $2, $3, $4)
+            on conflict (activity_id) do nothing
+            "#,
+        )
+        .bind(activity_id)
+        .bind(actor_id.0)
+        .bind(activity_type)
+        .bind(Utc::now())
+        .execute(self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+}
+
 fn local_actor_from_row(row: sqlx::sqlite::SqliteRow) -> Result<LocalActor, DbError> {
     Ok(LocalActor {
         profile: actor_profile_from_columns(&row)?,
@@ -856,6 +938,7 @@ fn delivery_kind_to_db(kind: &DeliveryKind) -> &'static str {
     match kind {
         DeliveryKind::Follow => "follow",
         DeliveryKind::Create => "create",
+        DeliveryKind::Accept => "accept",
     }
 }
 
@@ -863,6 +946,7 @@ fn delivery_kind_from_db(value: &str) -> Result<DeliveryKind, DbError> {
     match value {
         "follow" => Ok(DeliveryKind::Follow),
         "create" => Ok(DeliveryKind::Create),
+        "accept" => Ok(DeliveryKind::Accept),
         _ => Err(DbError::UnknownDeliveryKind(value.to_string())),
     }
 }

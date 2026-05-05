@@ -2,15 +2,18 @@ use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::get,
+    routing::post,
 };
 use kodamapub_activitypub::{
-    is_publicly_visible, local_actor_to_object, ordered_collection, ordered_collection_page,
-    post_to_create_activity, post_to_note, webfinger_response,
+    IncomingActivity, fetch_remote_actor, is_publicly_visible, local_actor_to_object,
+    ordered_collection, ordered_collection_page, parse_incoming_activity, post_to_create_activity,
+    post_to_note, signature_key_id_actor_url, verify_incoming_activity_signature,
+    webfinger_response,
 };
 use kodamapub_db::{Database, DbError};
 use kodamapub_domain::{
@@ -24,7 +27,10 @@ use serde::{Deserialize, Serialize};
 struct AppState {
     db: Database,
     public_base_url: PublicBaseUrl,
+    remote_client: reqwest::Client,
 }
+
+const MAX_INBOX_BODY_BYTES: usize = 1_048_576;
 
 #[derive(Debug, Deserialize)]
 struct CreatePostRequest {
@@ -107,6 +113,18 @@ impl From<JobError> for ApiError {
     }
 }
 
+impl From<kodamapub_activitypub::ActivityPubError> for ApiError {
+    fn from(value: kodamapub_activitypub::ActivityPubError) -> Self {
+        Self::Internal(value.into())
+    }
+}
+
+impl AppState {
+    fn remote_client(&self) -> &reqwest::Client {
+        &self.remote_client
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         match self {
@@ -130,6 +148,7 @@ fn build_app(state: Arc<AppState>, config: ServerConfig) -> Router {
         .route("/posts/{post_id}", get(get_post_activitypub))
         .route("/users/{username}", get(get_actor))
         .route("/users/{username}/outbox", get(get_outbox))
+        .route("/users/{username}/inbox", post(post_inbox))
         .route(
             "/users/{username}/posts",
             get(list_user_posts).post(create_user_post),
@@ -328,6 +347,80 @@ async fn get_webfinger(
     jrd_response(&webfinger_response(query.resource, actor.profile.actor_url))
 }
 
+async fn post_inbox(
+    State((state, _config)): State<(Arc<AppState>, ServerConfig)>,
+    Path(path): Path<UsernamePath>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let local_actor = state
+        .db
+        .local_actors()
+        .find_by_username(&path.username)
+        .await?
+        .ok_or(ApiError::NotFound("local actor not found"))?;
+
+    ensure_inbox_content_type(&headers)?;
+    if body.len() > MAX_INBOX_BODY_BYTES {
+        return Err(ApiError::BadRequest("inbox payload too large".to_string()));
+    }
+
+    let body_text = std::str::from_utf8(&body)
+        .map_err(|_| ApiError::BadRequest("inbox payload must be utf-8".to_string()))?;
+    let activity = parse_incoming_activity(body_text)?;
+    let activity_id = incoming_activity_id(&activity);
+    let activity_type = incoming_activity_type(&activity);
+
+    let key_actor_url = signature_key_id_actor_url(&headers)?;
+    let activity_actor_url = incoming_activity_actor_url(&activity);
+    if strip_fragment(&key_actor_url) != strip_fragment(&activity_actor_url) {
+        return Err(ApiError::BadRequest(
+            "signature actor does not match activity actor".to_string(),
+        ));
+    }
+
+    let remote_actor = fetch_remote_actor(state.remote_client(), &key_actor_url).await?;
+    state.db.remote_actors().upsert(&remote_actor).await?;
+
+    let signature_target = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or_else(|| uri.path());
+    verify_incoming_activity_signature(
+        &headers,
+        method.as_str(),
+        signature_target,
+        body.as_ref(),
+        remote_actor
+            .public_key_pem
+            .as_deref()
+            .ok_or_else(|| ApiError::BadRequest("remote actor missing public key".to_string()))?,
+    )?;
+
+    if !state
+        .db
+        .inbox_dedup()
+        .record(&activity_id, remote_actor.id(), &activity_type)
+        .await?
+    {
+        return Ok(StatusCode::ACCEPTED);
+    }
+
+    match activity {
+        IncomingActivity::Follow(follow) => {
+            handle_follow_activity(&state, &local_actor, &remote_actor, follow).await?;
+        }
+        IncomingActivity::Create(create) => {
+            handle_create_activity(&state, &remote_actor, create).await?;
+        }
+        IncomingActivity::Accept(_) | IncomingActivity::Undo(_) | IncomingActivity::Delete(_) => {}
+    }
+
+    Ok(StatusCode::ACCEPTED)
+}
+
 async fn find_local_actor_by_id(
     state: &AppState,
     actor_id: kodamapub_domain::ActorId,
@@ -412,6 +505,7 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         db,
         public_base_url,
+        remote_client: reqwest::Client::new(),
     });
     let config = ServerConfig {
         public_base_url: state.public_base_url.clone(),
@@ -422,6 +516,143 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+async fn handle_follow_activity(
+    state: &AppState,
+    local_actor: &kodamapub_domain::LocalActor,
+    remote_actor: &kodamapub_domain::RemoteActor,
+    follow: kodamapub_activitypub::IncomingFollowActivity,
+) -> Result<(), ApiError> {
+    if remote_actor.profile.inbox_url.is_none() {
+        tracing::warn!(
+            remote_actor = %remote_actor.profile.actor_url,
+            "received follow from remote actor without inbox url"
+        );
+        return Ok(());
+    }
+
+    let job = kodamapub_job::enqueue_accept_delivery(
+        &state.db,
+        local_actor,
+        remote_actor,
+        &follow.id,
+        &RetryPolicy::default(),
+    )
+    .await?;
+    tracing::info!(job_id = %job.id.0, "queued accept delivery for inbound follow");
+    Ok(())
+}
+
+async fn handle_create_activity(
+    state: &AppState,
+    remote_actor: &kodamapub_domain::RemoteActor,
+    create: kodamapub_activitypub::IncomingCreateActivity,
+) -> Result<(), ApiError> {
+    let in_reply_to = match create.object.in_reply_to {
+        Some(reply_to) => state
+            .db
+            .posts()
+            .find_by_url(&reply_to)
+            .await?
+            .map(|post| post.id),
+        None => None,
+    };
+    let visibility = visibility_from_audience(&create.object.to, &create.object.cc);
+    let content_source = create
+        .object
+        .content
+        .parse::<ContentSource>()
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let post = Post {
+        id: kodamapub_domain::PostId::new(),
+        actor_id: remote_actor.id(),
+        url: create.object.id,
+        content_source,
+        content_format: ContentFormat::Plaintext,
+        content_html: create.object.content,
+        visibility,
+        in_reply_to,
+        created_at: create.object.published,
+    };
+
+    state.db.posts().upsert_remote(&post).await?;
+    Ok(())
+}
+
+fn visibility_from_audience(to: &[url::Url], cc: &[url::Url]) -> Visibility {
+    let public = "https://www.w3.org/ns/activitystreams#Public";
+    let followers = to
+        .iter()
+        .chain(cc.iter())
+        .any(|url| url.path().ends_with("/followers"));
+
+    if to.iter().chain(cc.iter()).any(|url| url.as_str() == public) {
+        Visibility::Public
+    } else if followers {
+        Visibility::Followers
+    } else if !to.is_empty() || !cc.is_empty() {
+        Visibility::Direct
+    } else {
+        Visibility::Unlisted
+    }
+}
+
+fn incoming_activity_id(activity: &IncomingActivity) -> String {
+    match activity {
+        IncomingActivity::Follow(value) => value.id.to_string(),
+        IncomingActivity::Create(value) => value.id.to_string(),
+        IncomingActivity::Accept(value) => value.id.to_string(),
+        IncomingActivity::Undo(value) => value.id.to_string(),
+        IncomingActivity::Delete(value) => value.id.to_string(),
+    }
+}
+
+fn incoming_activity_type(activity: &IncomingActivity) -> String {
+    match activity {
+        IncomingActivity::Follow(_) => "Follow",
+        IncomingActivity::Create(_) => "Create",
+        IncomingActivity::Accept(_) => "Accept",
+        IncomingActivity::Undo(_) => "Undo",
+        IncomingActivity::Delete(_) => "Delete",
+    }
+    .to_string()
+}
+
+fn incoming_activity_actor_url(activity: &IncomingActivity) -> url::Url {
+    match activity {
+        IncomingActivity::Follow(value) => value.actor.clone(),
+        IncomingActivity::Create(value) => value.actor.clone(),
+        IncomingActivity::Accept(value) => value.actor.clone(),
+        IncomingActivity::Undo(value) => value.actor.clone(),
+        IncomingActivity::Delete(value) => value.actor.clone(),
+    }
+}
+
+fn strip_fragment(url: &url::Url) -> String {
+    let mut value = url.clone();
+    value.set_fragment(None);
+    value.as_str().to_string()
+}
+
+fn ensure_inbox_content_type(headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(content_type) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Err(ApiError::BadRequest("missing content-type".to_string()));
+    };
+
+    if content_type.contains("application/activity+json")
+        || content_type.contains("application/ld+json")
+        || content_type.contains("application/json")
+    {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(
+            "unsupported content-type for inbox".to_string(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -483,6 +714,7 @@ mod tests {
         let state = Arc::new(AppState {
             db,
             public_base_url: "https://example.invalid".parse().expect("public base url"),
+            remote_client: reqwest::Client::new(),
         });
 
         build_app(

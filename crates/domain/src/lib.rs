@@ -92,6 +92,7 @@ pub enum DeliveryState {
 pub enum DeliveryKind {
     Follow,
     Create,
+    Accept,
 }
 
 fn validate_nonempty_string(

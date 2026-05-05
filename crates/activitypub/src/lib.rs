@@ -1,21 +1,24 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
+use http::HeaderMap;
 use kodamapub_domain::{
     ActorProfile, DeliveryKind, LocalActor, Post, PostId, RemoteActor, Visibility,
 };
 use reqwest::{
     Client,
-    header::{ACCEPT, CONTENT_TYPE, DATE, HOST, HeaderMap, HeaderValue},
+    header::{ACCEPT, CONTENT_TYPE, DATE, HOST, HeaderValue},
 };
 use rsa::{
-    RsaPrivateKey,
+    RsaPrivateKey, RsaPublicKey,
     pkcs1v15::SigningKey,
-    pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey, LineEnding},
+    pkcs1v15::VerifyingKey,
+    pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding},
     rand_core::OsRng,
-    signature::{RandomizedSigner, SignatureEncoding},
+    signature::{RandomizedSigner, SignatureEncoding, Verifier},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use std::collections::HashMap;
 use url::Url;
 use uuid::Uuid;
 
@@ -33,6 +36,14 @@ pub enum ActivityPubError {
     MissingInboxUrl,
     #[error("remote actor missing id")]
     MissingActorId,
+    #[error("missing signature header")]
+    MissingSignatureHeader,
+    #[error("missing digest header")]
+    MissingDigestHeader,
+    #[error("invalid signature header: {0}")]
+    InvalidSignatureHeader(String),
+    #[error("signature verification failed")]
+    SignatureVerificationFailed,
     #[error("unable to generate local actor keypair: {0}")]
     KeyGeneration(String),
     #[error("unable to sign request: {0}")]
@@ -138,6 +149,17 @@ pub struct UndoActivity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeleteActivity {
+    #[serde(rename = "@context")]
+    pub context: String,
+    pub id: Url,
+    #[serde(rename = "type")]
+    pub object_type: String,
+    pub actor: Url,
+    pub object: Url,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OrderedCollection {
     #[serde(rename = "@context")]
     pub context: String,
@@ -185,6 +207,61 @@ pub struct RemoteActorDiscovery {
     pub actor: RemoteActor,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncomingActivity {
+    Follow(IncomingFollowActivity),
+    Create(IncomingCreateActivity),
+    Accept(IncomingAcceptActivity),
+    Undo(IncomingUndoActivity),
+    Delete(IncomingDeleteActivity),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingFollowActivity {
+    pub id: Url,
+    pub actor: Url,
+    pub object: Url,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingCreateActivity {
+    pub id: Url,
+    pub actor: Url,
+    pub object: IncomingNoteObject,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingAcceptActivity {
+    pub id: Url,
+    pub actor: Url,
+    pub object: Url,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingUndoActivity {
+    pub id: Url,
+    pub actor: Url,
+    pub object: Url,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingDeleteActivity {
+    pub id: Url,
+    pub actor: Url,
+    pub object: Url,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingNoteObject {
+    pub id: Url,
+    pub attributed_to: Url,
+    pub content: String,
+    pub published: DateTime<Utc>,
+    pub to: Vec<Url>,
+    pub cc: Vec<Url>,
+    pub in_reply_to: Option<Url>,
+}
+
 #[derive(Debug, Deserialize)]
 struct RemoteActorResponse {
     id: Option<Url>,
@@ -219,7 +296,7 @@ pub async fn discover_remote_actor(
     client: &Client,
     resource: &str,
 ) -> Result<RemoteActorDiscovery, ActivityPubError> {
-    let (username, host) = parse_acct_resource(resource)?;
+    let (_username, host) = parse_acct_resource(resource)?;
     let webfinger_url = webfinger_url_for_host(&host, resource)?;
 
     let webfinger = client
@@ -240,6 +317,18 @@ pub async fn discover_remote_actor(
             ActivityPubError::InvalidResource("webfinger self link missing".to_string())
         })?;
 
+    let actor = fetch_remote_actor(client, &actor_url).await?;
+
+    Ok(RemoteActorDiscovery {
+        resource: resource.to_string(),
+        actor,
+    })
+}
+
+pub async fn fetch_remote_actor(
+    client: &Client,
+    actor_url: &Url,
+) -> Result<RemoteActor, ActivityPubError> {
     let actor_json = client
         .get(actor_url.clone())
         .header(ACCEPT, "application/activity+json, application/ld+json")
@@ -249,13 +338,23 @@ pub async fn discover_remote_actor(
         .json::<RemoteActorResponse>()
         .await?;
 
-    let actor_id = actor_json.id.clone().unwrap_or(actor_url);
-    let preferred_username = actor_json
-        .preferred_username
-        .unwrap_or_else(|| username.clone());
+    let actor_id = actor_json.id.clone().unwrap_or_else(|| actor_url.clone());
+    let preferred_username = actor_json.preferred_username.unwrap_or_else(|| {
+        actor_id
+            .path_segments()
+            .and_then(|mut segments| segments.next_back())
+            .unwrap_or("remote")
+            .to_string()
+    });
     let username = preferred_username
         .parse::<kodamapub_domain::Username>()
-        .or_else(|_| username.parse::<kodamapub_domain::Username>())
+        .or_else(|_| {
+            actor_id
+                .path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .unwrap_or("remote")
+                .parse::<kodamapub_domain::Username>()
+        })
         .map_err(|error| ActivityPubError::InvalidResource(error.to_string()))?;
     let display_name = actor_json
         .name
@@ -269,7 +368,7 @@ pub async fn discover_remote_actor(
         .transpose()
         .map_err(|error| ActivityPubError::InvalidResource(error.to_string()))?;
 
-    let actor = RemoteActor {
+    Ok(RemoteActor {
         profile: ActorProfile::new(
             username,
             display_name,
@@ -280,11 +379,6 @@ pub async fn discover_remote_actor(
         ),
         public_key_pem: actor_json.public_key.map(|key| key.public_key_pem),
         fetched_at: Utc::now(),
-    };
-
-    Ok(RemoteActorDiscovery {
-        resource: resource.to_string(),
-        actor,
     })
 }
 
@@ -406,6 +500,24 @@ pub fn follow_activity(local_actor: &LocalActor, remote_actor: &RemoteActor) -> 
     }
 }
 
+pub fn accept_activity(
+    local_actor: &LocalActor,
+    remote_actor: &RemoteActor,
+    follow_activity_id: &Url,
+) -> AcceptActivity {
+    AcceptActivity {
+        context: ACTIVITY_STREAMS_CONTEXT.to_string(),
+        id: accept_activity_id(
+            &local_actor.profile.actor_url,
+            &remote_actor.profile.actor_url,
+            follow_activity_id,
+        ),
+        object_type: "Accept".to_string(),
+        actor: local_actor.profile.actor_url.clone(),
+        object: follow_activity_id.clone(),
+    }
+}
+
 pub fn ordered_collection(id: Url, first: Option<Url>, total_items: u64) -> OrderedCollection {
     OrderedCollection {
         context: ACTIVITY_STREAMS_CONTEXT.to_string(),
@@ -452,6 +564,7 @@ pub fn activity_kind_for_payload(payload: &str) -> Result<DeliveryKind, Activity
     match json.get("type").and_then(|value| value.as_str()) {
         Some("Follow") => Ok(DeliveryKind::Follow),
         Some("Create") => Ok(DeliveryKind::Create),
+        Some("Accept") => Ok(DeliveryKind::Accept),
         Some(other) => Err(ActivityPubError::InvalidResource(format!(
             "unsupported activity type {other}"
         ))),
@@ -459,6 +572,281 @@ pub fn activity_kind_for_payload(payload: &str) -> Result<DeliveryKind, Activity
             "activity payload missing type".to_string(),
         )),
     }
+}
+
+pub fn parse_incoming_activity(body: &str) -> Result<IncomingActivity, ActivityPubError> {
+    let value: serde_json::Value = serde_json::from_str(body)?;
+    let activity_type = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ActivityPubError::InvalidResource("activity missing type".to_string()))?;
+    let id = parse_url_field(&value, "id")?;
+    let actor = parse_url_field(&value, "actor")?;
+
+    match activity_type {
+        "Follow" => Ok(IncomingActivity::Follow(IncomingFollowActivity {
+            id,
+            actor,
+            object: parse_url_field(&value, "object")?,
+        })),
+        "Create" => Ok(IncomingActivity::Create(IncomingCreateActivity {
+            id,
+            actor,
+            object: parse_incoming_note_object(value.get("object").ok_or_else(|| {
+                ActivityPubError::InvalidResource("create activity missing object".to_string())
+            })?)?,
+        })),
+        "Accept" => Ok(IncomingActivity::Accept(IncomingAcceptActivity {
+            id,
+            actor,
+            object: parse_url_field(&value, "object")?,
+        })),
+        "Undo" => Ok(IncomingActivity::Undo(IncomingUndoActivity {
+            id,
+            actor,
+            object: parse_url_field(&value, "object")?,
+        })),
+        "Delete" => Ok(IncomingActivity::Delete(IncomingDeleteActivity {
+            id,
+            actor,
+            object: parse_url_field(&value, "object")?,
+        })),
+        other => Err(ActivityPubError::InvalidResource(format!(
+            "unsupported activity type {other}"
+        ))),
+    }
+}
+
+pub fn verify_incoming_activity_signature(
+    headers: &HeaderMap,
+    method: &str,
+    request_target: &str,
+    body: &[u8],
+    public_key_pem: &str,
+) -> Result<(), ActivityPubError> {
+    let signature_header = headers
+        .get("Signature")
+        .ok_or(ActivityPubError::MissingSignatureHeader)?
+        .to_str()
+        .map_err(|error: http::header::ToStrError| {
+            ActivityPubError::InvalidSignatureHeader(error.to_string())
+        })?;
+    let digest_header = headers
+        .get("Digest")
+        .ok_or(ActivityPubError::MissingDigestHeader)?
+        .to_str()
+        .map_err(|error: http::header::ToStrError| {
+            ActivityPubError::InvalidSignatureHeader(error.to_string())
+        })?;
+    let header_map = parse_signature_header(signature_header)?;
+    let headers_list = header_map
+        .get("headers")
+        .cloned()
+        .unwrap_or_else(|| "(request-target) host date digest".to_string());
+    let key_id = header_map
+        .get("keyId")
+        .ok_or_else(|| ActivityPubError::InvalidSignatureHeader("missing keyId".to_string()))?;
+    let signature = header_map
+        .get("signature")
+        .ok_or_else(|| ActivityPubError::InvalidSignatureHeader("missing signature".to_string()))?;
+
+    let expected_digest = digest_header_value(
+        std::str::from_utf8(body)
+            .map_err(|error| ActivityPubError::InvalidSignatureHeader(error.to_string()))?,
+    );
+    if expected_digest != digest_header {
+        return Err(ActivityPubError::SignatureVerificationFailed);
+    }
+
+    let signing_string = canonical_signature_string(
+        headers,
+        method,
+        request_target,
+        &headers_list,
+        digest_header,
+    )?;
+
+    let public_key = RsaPublicKey::from_public_key_pem(public_key_pem)
+        .map_err(|error| ActivityPubError::Signing(error.to_string()))?;
+    let verifying_key = VerifyingKey::<Sha256>::new_unprefixed(public_key);
+    let signature = rsa::pkcs1v15::Signature::try_from(
+        STANDARD
+            .decode(signature)
+            .map_err(|error: base64::DecodeError| {
+                ActivityPubError::InvalidSignatureHeader(error.to_string())
+            })?
+            .as_slice(),
+    )
+    .map_err(|error: rsa::signature::Error| {
+        ActivityPubError::InvalidSignatureHeader(error.to_string())
+    })?;
+    verifying_key
+        .verify(signing_string.as_bytes(), &signature)
+        .map_err(|_| ActivityPubError::SignatureVerificationFailed)?;
+
+    let _ = key_id;
+    Ok(())
+}
+
+pub fn signature_key_id_actor_url(headers: &HeaderMap) -> Result<Url, ActivityPubError> {
+    let signature_header = headers
+        .get("Signature")
+        .ok_or(ActivityPubError::MissingSignatureHeader)?
+        .to_str()
+        .map_err(|error: http::header::ToStrError| {
+            ActivityPubError::InvalidSignatureHeader(error.to_string())
+        })?;
+    let header_map = parse_signature_header(signature_header)?;
+    let key_id = header_map
+        .get("keyId")
+        .ok_or_else(|| ActivityPubError::InvalidSignatureHeader("missing keyId".to_string()))?;
+    let mut url: Url = key_id.parse().map_err(|error: url::ParseError| {
+        ActivityPubError::InvalidSignatureHeader(error.to_string())
+    })?;
+    url.set_fragment(None);
+    Ok(url)
+}
+
+fn parse_signature_header(header: &str) -> Result<HashMap<String, String>, ActivityPubError> {
+    let mut values = HashMap::new();
+    for part in header.split(',') {
+        let (name, value) = part
+            .split_once('=')
+            .ok_or_else(|| ActivityPubError::InvalidSignatureHeader(header.to_string()))?;
+        values.insert(
+            name.trim().to_string(),
+            value.trim().trim_matches('"').to_string(),
+        );
+    }
+
+    Ok(values)
+}
+
+fn canonical_signature_string(
+    headers: &HeaderMap,
+    method: &str,
+    request_target: &str,
+    headers_list: &str,
+    digest_header: &str,
+) -> Result<String, ActivityPubError> {
+    let mut lines = Vec::new();
+    for header_name in headers_list.split_whitespace() {
+        match header_name {
+            "(request-target)" => {
+                lines.push(format!(
+                    "(request-target): {} {}",
+                    method.to_ascii_lowercase(),
+                    request_target
+                ));
+            }
+            "host" => {
+                let value = headers
+                    .get("Host")
+                    .ok_or_else(|| {
+                        ActivityPubError::InvalidSignatureHeader("missing host".to_string())
+                    })?
+                    .to_str()
+                    .map_err(|error| ActivityPubError::InvalidSignatureHeader(error.to_string()))?;
+                lines.push(format!("host: {value}"));
+            }
+            "date" => {
+                let value = headers
+                    .get("Date")
+                    .ok_or_else(|| {
+                        ActivityPubError::InvalidSignatureHeader("missing date".to_string())
+                    })?
+                    .to_str()
+                    .map_err(|error| ActivityPubError::InvalidSignatureHeader(error.to_string()))?;
+                lines.push(format!("date: {value}"));
+            }
+            "digest" => lines.push(format!("digest: {digest_header}")),
+            other => {
+                let value = headers
+                    .get(other)
+                    .ok_or_else(|| {
+                        ActivityPubError::InvalidSignatureHeader(format!("missing {other}"))
+                    })?
+                    .to_str()
+                    .map_err(|error| ActivityPubError::InvalidSignatureHeader(error.to_string()))?;
+                lines.push(format!("{other}: {value}"));
+            }
+        }
+    }
+
+    Ok(lines.join("\n"))
+}
+
+fn parse_url_field(value: &serde_json::Value, field: &str) -> Result<Url, ActivityPubError> {
+    let raw = value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ActivityPubError::InvalidResource(format!("activity missing {field}")))?;
+    raw.parse::<Url>()
+        .map_err(|error: url::ParseError| ActivityPubError::InvalidResource(error.to_string()))
+}
+
+fn parse_url_list(value: Option<&serde_json::Value>) -> Result<Vec<Url>, ActivityPubError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+
+    if let Some(raw) = value.as_str() {
+        return raw
+            .parse::<Url>()
+            .map(|url| vec![url])
+            .map_err(|error: url::ParseError| {
+                ActivityPubError::InvalidResource(error.to_string())
+            });
+    }
+
+    let Some(array) = value.as_array() else {
+        return Ok(Vec::new());
+    };
+
+    array
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(|item| {
+            item.parse::<Url>().map_err(|error: url::ParseError| {
+                ActivityPubError::InvalidResource(error.to_string())
+            })
+        })
+        .collect()
+}
+
+fn parse_optional_url(value: Option<&serde_json::Value>) -> Result<Option<Url>, ActivityPubError> {
+    match value.and_then(serde_json::Value::as_str) {
+        Some(raw) => raw
+            .parse::<Url>()
+            .map(Some)
+            .map_err(|error: url::ParseError| ActivityPubError::InvalidResource(error.to_string())),
+        None => Ok(None),
+    }
+}
+
+fn parse_incoming_note_object(
+    value: &serde_json::Value,
+) -> Result<IncomingNoteObject, ActivityPubError> {
+    Ok(IncomingNoteObject {
+        id: parse_url_field(value, "id")?,
+        attributed_to: parse_url_field(value, "attributedTo")?,
+        content: value
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        published: value
+            .get("published")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ActivityPubError::InvalidResource("note missing published".to_string()))?
+            .parse::<DateTime<Utc>>()
+            .map_err(|error: chrono::ParseError| {
+                ActivityPubError::InvalidResource(error.to_string())
+            })?,
+        to: parse_url_list(value.get("to"))?,
+        cc: parse_url_list(value.get("cc"))?,
+        in_reply_to: parse_optional_url(value.get("inReplyTo"))?,
+    })
 }
 
 fn signed_headers(
@@ -606,6 +994,21 @@ fn follow_activity_id(local_actor_url: &Url, remote_actor_url: &Url) -> Url {
         Uuid::now_v7()
     ))
     .expect("follow activity URL")
+}
+
+fn accept_activity_id(
+    local_actor_url: &Url,
+    remote_actor_url: &Url,
+    follow_activity_id: &Url,
+) -> Url {
+    Url::parse(&format!(
+        "{}#accept-{}-{}-{}",
+        local_actor_url.as_str(),
+        sanitize_for_fragment(remote_actor_url.host_str().unwrap_or("remote")),
+        sanitize_for_fragment(follow_activity_id.path()),
+        Uuid::now_v7()
+    ))
+    .expect("accept activity URL")
 }
 
 fn sanitize_for_fragment(value: &str) -> String {

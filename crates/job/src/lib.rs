@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use kodamapub_activitypub::{
-    ActivityPubError, activity_kind_for_payload, deliver_signed_activity, follow_activity,
-    serialize_activity,
+    ActivityPubError, accept_activity, activity_kind_for_payload, deliver_signed_activity,
+    follow_activity, serialize_activity,
 };
 use kodamapub_db::Database;
 use kodamapub_domain::{
@@ -67,6 +67,35 @@ pub async fn enqueue_follow_delivery(
         local_actor.id(),
         inbox_url,
         DeliveryKind::Follow,
+        payload,
+        retry_policy.max_attempts,
+    );
+
+    db.delivery_jobs().create(&job).await?;
+    Ok(job)
+}
+
+pub async fn enqueue_accept_delivery(
+    db: &Database,
+    local_actor: &LocalActor,
+    remote_actor: &RemoteActor,
+    follow_activity_id: &url::Url,
+    retry_policy: &RetryPolicy,
+) -> Result<DeliveryJob, JobError> {
+    let inbox_url = remote_actor
+        .profile
+        .inbox_url
+        .clone()
+        .ok_or(JobError::MissingInboxUrl)?;
+    let payload = serialize_activity(&accept_activity(
+        local_actor,
+        remote_actor,
+        follow_activity_id,
+    ))?;
+    let job = DeliveryJob::new(
+        local_actor.id(),
+        inbox_url,
+        DeliveryKind::Accept,
         payload,
         retry_policy.max_attempts,
     );
