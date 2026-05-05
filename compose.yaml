@@ -1,0 +1,67 @@
+services:
+  edge:
+    build:
+      context: .
+      dockerfile: scripts/docker/edge.Dockerfile
+    command: ["cargo", "run", "-p", "kodamapub-edge"]
+    environment:
+      EDGE_LISTEN_ADDR: 0.0.0.0:8080
+      RUST_LOG: info
+      UPSTREAM_WEB_ADDR: web:5173
+      UPSTREAM_WEB_HOST: web
+      UPSTREAM_ADDR: server:3000
+      UPSTREAM_HOST: server
+    depends_on:
+      - server
+      - web
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - cargo-target:/workspace/target
+    working_dir: /workspace
+
+  server:
+    build:
+      context: .
+      dockerfile: scripts/docker/server.Dockerfile
+    command: ["cargo", "run", "-p", "kodamapub-server"]
+    environment:
+      BIND_ADDR: 0.0.0.0:3000
+      DATABASE_URL: sqlite:///data/kodamapub.db?mode=rwc
+      PUBLIC_BASE_URL: http://localhost:8080
+    expose:
+      - "3000"
+    volumes:
+      - ./:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - cargo-target:/workspace/target
+      - server-data:/data
+    working_dir: /workspace
+
+  web:
+    build:
+      context: .
+      dockerfile: scripts/docker/web.Dockerfile
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "5173"]
+    environment:
+      VITE_API_TARGET: http://edge:8080
+      VITE_DEFAULT_USERNAME: alice
+    depends_on:
+      - server
+    expose:
+      - "5173"
+    volumes:
+      - ./:/workspace
+      - web-node-modules:/workspace/apps/web/node_modules
+    working_dir: /workspace/apps/web
+
+volumes:
+  cargo-git:
+  cargo-registry:
+  cargo-target:
+  server-data:
+  web-node-modules:
