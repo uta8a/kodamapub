@@ -104,6 +104,46 @@ pub async fn enqueue_accept_delivery(
     Ok(job)
 }
 
+pub async fn enqueue_existing_create_deliveries(
+    db: &Database,
+    local_actor: &LocalActor,
+    remote_actor: &RemoteActor,
+    retry_policy: &RetryPolicy,
+) -> Result<u32, JobError> {
+    let mut created = 0u32;
+    let mut before = None;
+
+    loop {
+        let page = db.posts().list_public_by_actor(local_actor.id(), before, 100).await?;
+        for post in &page.posts {
+            let Some(inbox_url) = remote_actor.profile.inbox_url.clone() else {
+                return Err(JobError::MissingInboxUrl);
+            };
+            let payload = serialize_activity(&kodamapub_activitypub::post_to_create_activity(
+                post,
+                &local_actor.profile,
+            ))?;
+            let job = DeliveryJob::new(
+                local_actor.id(),
+                inbox_url,
+                DeliveryKind::Create,
+                payload,
+                retry_policy.max_attempts,
+            );
+            db.delivery_jobs().create(&job).await?;
+            created += 1;
+        }
+
+        if let Some(next_before) = page.next_cursor {
+            before = Some(next_before);
+        } else {
+            break;
+        }
+    }
+
+    Ok(created)
+}
+
 pub async fn enqueue_create_deliveries(
     db: &Database,
     local_actor: &LocalActor,
@@ -227,8 +267,21 @@ async fn maybe_activate_follow(
         return Ok(());
     };
 
+    if let Some(existing_follow) = db
+        .follows()
+        .find(local_actor.id(), remote_actor.id())
+        .await?
+    {
+        if existing_follow.state == FollowState::Active {
+            return Ok(());
+        }
+    }
+
     db.follows()
         .set_state(local_actor.id(), remote_actor.id(), FollowState::Active)
+        .await?;
+
+    enqueue_existing_create_deliveries(db, local_actor, &remote_actor, &RetryPolicy::default())
         .await?;
     Ok(())
 }
@@ -367,6 +420,86 @@ mod tests {
             .expect("process due jobs");
         assert_eq!(summary.delivered, 1);
         assert_eq!(*inbox_state.calls.lock().await, 1);
+
+        let follow = db
+            .follows()
+            .find(local_actor.id(), remote_actor.id())
+            .await
+            .expect("find follow")
+            .expect("follow exists");
+        assert_eq!(follow.state, FollowState::Active);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn process_due_jobs_backfills_existing_public_posts_after_follow_accept() {
+        #[derive(Clone, Default)]
+        struct InboxState {
+            calls: Arc<Mutex<u32>>,
+        }
+
+        async fn inbox(
+            axum::extract::State(state): axum::extract::State<InboxState>,
+        ) -> impl IntoResponse {
+            *state.calls.lock().await += 1;
+            axum::http::StatusCode::ACCEPTED
+        }
+
+        let inbox_state = InboxState::default();
+        let app = Router::new()
+            .route("/users/bob/inbox", post(inbox))
+            .with_state(inbox_state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:38912")
+            .await
+            .expect("bind test server");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let db = memory_db().await;
+        let local_actor = sample_local_actor();
+        let remote_actor = sample_remote_actor("http://127.0.0.1:38912/users/bob/inbox");
+
+        db.local_actors()
+            .create(&local_actor)
+            .await
+            .expect("create local actor");
+        db.remote_actors()
+            .upsert(&remote_actor)
+            .await
+            .expect("upsert remote actor");
+
+        for content in ["first public post", "second public post"] {
+            let post = Post::new(
+                NewPost {
+                    actor_id: local_actor.id(),
+                    content_source: content.parse().expect("content source"),
+                    content_format: ContentFormat::Plaintext,
+                    visibility: Visibility::Public,
+                    in_reply_to: None,
+                },
+                &"https://example.invalid".parse().expect("public base url"),
+            )
+            .expect("post");
+            db.posts().create(&post).await.expect("insert post");
+        }
+
+        enqueue_follow_delivery(&db, &local_actor, &remote_actor, &RetryPolicy::default())
+            .await
+            .expect("enqueue follow delivery");
+
+        let first = process_due_jobs(&db, &RetryPolicy::default(), 10)
+            .await
+            .expect("process follow delivery");
+        assert_eq!(first.delivered, 1);
+        assert_eq!(*inbox_state.calls.lock().await, 1);
+
+        let second = process_due_jobs(&db, &RetryPolicy::default(), 10)
+            .await
+            .expect("process backfill deliveries");
+        assert_eq!(second.delivered, 2);
+        assert_eq!(*inbox_state.calls.lock().await, 3);
 
         let follow = db
             .follows()

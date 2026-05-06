@@ -54,6 +54,9 @@ async function proxyToApi(request: Request, path: string): Promise<Response> {
   for (const name of [
     "origin",
     "referer",
+    "date",
+    "digest",
+    "signature",
     "x-csrf-token",
     "x-forwarded-for",
     "x-forwarded-host",
