@@ -9,6 +9,7 @@ use kodamapub_job::{
     RetryPolicy, enqueue_follow_delivery, process_due_jobs, retry_failed_deliveries,
 };
 use reqwest::Client;
+use std::time::Duration;
 use url::Url;
 
 #[derive(Debug, Parser)]
@@ -79,6 +80,14 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         limit: i64,
     },
+    RunDeliveryWorker {
+        #[arg(long, env = "DATABASE_URL", default_value = "sqlite://kodamapub.db")]
+        database_url: String,
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
+        #[arg(long, default_value_t = 1)]
+        interval_seconds: u64,
+    },
 }
 
 #[tokio::main]
@@ -108,10 +117,19 @@ async fn main() -> anyhow::Result<()> {
             db.migrate().await?;
             let actor = build_local_actor(public_base_url, username, display_name, summary)?;
             let password_hash = hash_password(&password)?;
-            db.local_actors()
-                .create_with_password(&actor, &password_hash)
+            let stored_actor = match db.local_actors().find_by_username(&actor.profile.username).await? {
+                Some(existing) => existing,
+                None => {
+                    db.local_actors()
+                        .create_with_password(&actor, &password_hash)
+                        .await?;
+                    actor
+                }
+            };
+            db.local_actor_credentials()
+                .set_password_hash(stored_actor.id(), &password_hash)
                 .await?;
-            println!("{}", actor.profile.actor_url);
+            println!("{}", stored_actor.profile.actor_url);
         }
         Command::SetPassword {
             database_url,
@@ -233,6 +251,49 @@ async fn main() -> anyhow::Result<()> {
                 "delivered={} rescheduled={} failed={}",
                 summary.delivered, summary.rescheduled, summary.failed
             );
+        }
+        Command::RunDeliveryWorker {
+            database_url,
+            limit,
+            interval_seconds,
+        } => {
+            let db = Database::connect(&database_url).await?;
+            db.migrate().await?;
+            let retry_policy = RetryPolicy::default();
+            let interval = Duration::from_secs(interval_seconds.max(1));
+
+            tracing::info!(
+                limit,
+                interval_seconds,
+                "starting delivery worker"
+            );
+
+            loop {
+                match process_due_jobs(&db, &retry_policy, limit).await {
+                    Ok(summary) => {
+                        if summary.delivered > 0 || summary.rescheduled > 0 || summary.failed > 0
+                        {
+                            tracing::info!(
+                                delivered = summary.delivered,
+                                rescheduled = summary.rescheduled,
+                                failed = summary.failed,
+                                "processed due delivery jobs"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "delivery worker iteration failed");
+                    }
+                }
+
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = tokio::signal::ctrl_c() => {
+                        tracing::info!("delivery worker stopping");
+                        break;
+                    }
+                }
+            }
         }
     }
 

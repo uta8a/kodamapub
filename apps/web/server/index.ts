@@ -60,6 +60,7 @@ async function proxyToApi(request: Request, path: string): Promise<Response> {
     "digest",
     "signature",
     "x-csrf-token",
+    "x-original-host",
     "x-forwarded-for",
     "x-forwarded-host",
     "x-forwarded-proto",

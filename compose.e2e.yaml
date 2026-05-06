@@ -1,19 +1,104 @@
 services:
-  server:
+  edge:
+    image: kodamapub-edge
+    build:
+      context: .
+      dockerfile: scripts/docker/edge.Dockerfile
+    restart: unless-stopped
     environment:
-      PUBLIC_BASE_URL: http://edge
+      EDGE_LISTEN_ADDR: 0.0.0.0:443
+      RUST_LOG: info
+      UPSTREAM_WEB_ADDR: web:5173
+      UPSTREAM_WEB_HOST: web
+      UPSTREAM_ADDR: server:3000
+      UPSTREAM_HOST: server
+    depends_on:
+      - server
+      - web
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./tmp/certs:/certs:ro
+    expose:
+      - "8080"
+
+  server:
+    image: kodamapub-server
+    build:
+      context: .
+      dockerfile: scripts/docker/server.Dockerfile
+    restart: unless-stopped
+    environment:
+      BIND_ADDR: 0.0.0.0:3000
+      DATABASE_URL: sqlite:///data/kodamapub.db?mode=rwc
+      PUBLIC_BASE_URL: https://edge
+      KODAMAPUB_REMOTE_CA_CERT_PATH: /certs/kodamapub-e2e-ca.pem
     extra_hosts:
-      - host.docker.internal:host-gateway
+      - "mastodon.e2e:host-gateway"
+    expose:
+      - "3000"
+    volumes:
+      - server-data:/data
+      - ./tmp/certs:/certs:ro
 
   web:
+    image: kodamapub-web
+    build:
+      context: .
+      dockerfile: scripts/docker/web.Dockerfile
+    restart: unless-stopped
+    environment:
+      API_ORIGIN: http://server:3000
+      PORT: "5173"
+    depends_on:
+      - server
     extra_hosts:
-      - host.docker.internal:host-gateway
+      - "mastodon.e2e:host-gateway"
+    expose:
+      - "5173"
 
   cli-job:
+    image: kodamapub-cli-job
+    build:
+      context: .
+      dockerfile: scripts/docker/cli-job.Dockerfile
+    restart: "no"
     environment:
-      PUBLIC_BASE_URL: http://edge
+      DATABASE_URL: sqlite:///data/kodamapub.db?mode=rwc
+      KODAMAPUB_REMOTE_CA_CERT_PATH: /certs/kodamapub-e2e-ca.pem
     extra_hosts:
-      - host.docker.internal:host-gateway
+      - "mastodon.e2e:host-gateway"
+    volumes:
+      - server-data:/data
+      - ./tmp/certs:/certs:ro
+
+  delivery-worker:
+    image: kodamapub-cli-job
+    depends_on:
+      server:
+        condition: service_started
+    restart: unless-stopped
+    command: ["run-delivery-worker", "--limit", "100", "--interval-seconds", "1"]
+    environment:
+      DATABASE_URL: sqlite:///data/kodamapub.db?mode=rwc
+      KODAMAPUB_REMOTE_CA_CERT_PATH: /certs/kodamapub-e2e-ca.pem
+    extra_hosts:
+      - "mastodon.e2e:host-gateway"
+    volumes:
+      - server-data:/data
+      - ./tmp/certs:/certs:ro
+
+  mastodon-proxy:
+    image: nginx:1.27-alpine
+    depends_on:
+      mastodon-web:
+        condition: service_healthy
+    ports:
+      - "3001:443"
+    volumes:
+      - ./tmp/certs:/certs:ro
+      - ./scripts/docker/mastodon-proxy.conf:/etc/nginx/conf.d/default.conf:ro
 
   mastodon-db:
     image: postgres:16-alpine
@@ -41,18 +126,21 @@ services:
 
   mastodon-web:
     image: ghcr.io/mastodon/mastodon:${MASTODON_IMAGE_TAG:-v4.5.9}
+    user: root
     depends_on:
       mastodon-db:
         condition: service_healthy
       mastodon-redis:
         condition: service_healthy
-    ports:
-      - "3001:3000"
+    extra_hosts:
+      - "edge:host-gateway"
+    volumes:
+      - ./tmp/certs:/certs:ro
     environment:
       RAILS_ENV: production
       NODE_ENV: production
-      LOCAL_DOMAIN: host.docker.internal
-      WEB_DOMAIN: host.docker.internal:3001
+      LOCAL_DOMAIN: mastodon.e2e
+      WEB_DOMAIN: mastodon.e2e:3001
       LOCAL_HTTPS: "false"
       ALLOWED_PRIVATE_ADDRESSES: 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
       SECRET_KEY_BASE: ${MASTODON_SECRET_KEY_BASE}
@@ -62,6 +150,7 @@ services:
       ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT: ${MASTODON_ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT}
       VAPID_PRIVATE_KEY: ${MASTODON_VAPID_PRIVATE_KEY}
       VAPID_PUBLIC_KEY: ${MASTODON_VAPID_PUBLIC_KEY}
+      SSL_CERT_FILE: /certs/kodamapub-e2e-ca.pem
       DB_HOST: mastodon-db
       DB_PORT: "5432"
       DB_NAME: mastodon
@@ -74,9 +163,10 @@ services:
       FORCE_DEFAULT_LOCALE: "true"
       RAILS_SERVE_STATIC_FILES: "true"
       DISABLE_AUTOMATIC_SWITCHING_TO_APPROVED_REGISTRATIONS: "true"
-    extra_hosts:
-      - host.docker.internal:host-gateway
-    command: bundle exec puma -C config/puma.rb
+    command: >
+      sh -lc 'cp /certs/kodamapub-e2e-ca.pem /usr/local/share/ca-certificates/kodamapub-e2e-ca.crt
+      && update-ca-certificates >/dev/null
+      && exec bundle exec puma -C config/puma.rb'
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:3000/health | grep -q OK"]
       interval: 10s
@@ -85,16 +175,19 @@ services:
 
   mastodon-sidekiq:
     image: ghcr.io/mastodon/mastodon:${MASTODON_IMAGE_TAG:-v4.5.9}
+    user: root
     depends_on:
       mastodon-db:
         condition: service_healthy
       mastodon-redis:
         condition: service_healthy
+    extra_hosts:
+      - "edge:host-gateway"
     environment:
       RAILS_ENV: production
       NODE_ENV: production
-      LOCAL_DOMAIN: host.docker.internal
-      WEB_DOMAIN: host.docker.internal:3001
+      LOCAL_DOMAIN: mastodon.e2e
+      WEB_DOMAIN: mastodon.e2e:3001
       LOCAL_HTTPS: "false"
       ALLOWED_PRIVATE_ADDRESSES: 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
       SECRET_KEY_BASE: ${MASTODON_SECRET_KEY_BASE}
@@ -104,6 +197,7 @@ services:
       ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT: ${MASTODON_ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT}
       VAPID_PRIVATE_KEY: ${MASTODON_VAPID_PRIVATE_KEY}
       VAPID_PUBLIC_KEY: ${MASTODON_VAPID_PUBLIC_KEY}
+      SSL_CERT_FILE: /certs/kodamapub-e2e-ca.pem
       DB_HOST: mastodon-db
       DB_PORT: "5432"
       DB_NAME: mastodon
@@ -115,6 +209,12 @@ services:
       DEFAULT_LOCALE: en
       FORCE_DEFAULT_LOCALE: "true"
       DISABLE_AUTOMATIC_SWITCHING_TO_APPROVED_REGISTRATIONS: "true"
-    extra_hosts:
-      - host.docker.internal:host-gateway
-    command: bundle exec sidekiq -c 5 -q default -q push -q ingress -q mailers -q pull -q scheduler
+    volumes:
+      - ./tmp/certs:/certs:ro
+    command: >
+      sh -lc 'cp /certs/kodamapub-e2e-ca.pem /usr/local/share/ca-certificates/kodamapub-e2e-ca.crt
+      && update-ca-certificates >/dev/null
+      && exec bundle exec sidekiq -c 5 -q default -q push -q ingress -q mailers -q pull -q scheduler'
+
+volumes:
+  server-data:

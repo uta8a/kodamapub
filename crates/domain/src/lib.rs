@@ -14,6 +14,10 @@ impl ActorId {
     pub fn new() -> Self {
         Self(Uuid::now_v7())
     }
+
+    pub fn from_stable_name(name: &str) -> Self {
+        Self(Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes()))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]

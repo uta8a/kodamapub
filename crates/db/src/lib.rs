@@ -309,6 +309,31 @@ impl<'a> RemoteActorRepository<'a> {
 
         row.map(remote_actor_from_row).transpose()
     }
+
+    pub async fn find_by_inbox_url(&self, inbox_url: &Url) -> Result<Option<RemoteActor>, DbError> {
+        let row = sqlx::query(
+            r#"
+            select
+                a.id,
+                a.username,
+                a.display_name,
+                a.summary,
+                a.actor_url,
+                a.inbox_url,
+                a.outbox_url,
+                s.public_key_pem,
+                s.fetched_at
+            from actors a
+            join remote_actor_state s on s.actor_id = a.id
+            where a.inbox_url = $1
+            "#,
+        )
+        .bind(inbox_url.as_str())
+        .fetch_optional(self.pool)
+        .await?;
+
+        row.map(remote_actor_from_row).transpose()
+    }
 }
 
 impl<'a> LocalActorCredentialRepository<'a> {
