@@ -5,6 +5,24 @@ compose() {
   docker compose -f compose.yaml -f compose.e2e.yaml "$@"
 }
 
+ensure_edge_certs() {
+  local cert_dir="tmp/certs"
+  local cert_path="${cert_dir}/app.localhost.pem"
+  local key_path="${cert_dir}/app.localhost-key.pem"
+
+  if [[ -f "${cert_path}" && -f "${key_path}" ]]; then
+    return 0
+  fi
+
+  mkdir -p "${cert_dir}"
+
+  openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 3650 \
+    -keyout "${key_path}" \
+    -out "${cert_path}" \
+    -subj "/CN=app.localhost" \
+    -addext "subjectAltName=DNS:app.localhost,DNS:localhost,IP:127.0.0.1"
+}
+
 wait_for_http() {
   local url="$1"
   local label="$2"
@@ -257,6 +275,7 @@ main() {
 
   : "${PUBLIC_BASE_URL:=http://edge}"
   export PUBLIC_BASE_URL
+  ensure_edge_certs
   generate_mastodon_secrets
 
   trap 'status=$?; if [ "$status" -ne 0 ]; then compose logs --no-color --timestamps server mastodon-web mastodon-sidekiq mastodon-db mastodon-redis >&2 || true; fi; compose down -v --remove-orphans >/dev/null 2>&1 || true; exit "$status"' EXIT
