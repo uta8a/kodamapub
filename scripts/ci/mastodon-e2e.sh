@@ -58,8 +58,8 @@ generate_mastodon_secrets() {
   local mastodon_image="ghcr.io/mastodon/mastodon:${image}"
   local secret_key_base otp_secret vapid_output
 
-  secret_key_base="$(docker run --rm "${mastodon_image}" bin/rake secret)"
-  otp_secret="$(docker run --rm "${mastodon_image}" bin/rake secret)"
+  secret_key_base="$(docker run --rm "${mastodon_image}" bin/rails secret)"
+  otp_secret="$(docker run --rm "${mastodon_image}" bin/rails secret)"
   vapid_output="$(
     docker run --rm \
       -e SECRET_KEY_BASE="${secret_key_base}" \
