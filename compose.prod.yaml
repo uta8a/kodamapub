@@ -52,6 +52,29 @@ services:
     expose:
       - "5173"
 
+  delivery-worker:
+    image: ghcr.io/uta8a/kodamapub-cli-job:${KODAMAPUB_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      - server
+    environment:
+      DATABASE_URL: sqlite:///data/kodamapub.db?mode=rwc
+      DELIVERY_RUN_INTERVAL_SECONDS: "60"
+      DELIVERY_RUN_LIMIT: "100"
+    volumes:
+      - server-data:/data
+    entrypoint:
+      - /bin/sh
+      - -lc
+    command:
+      - |
+        while true; do
+          /usr/local/bin/kodamapub-cli run-deliveries \
+            --database-url "$${DATABASE_URL}" \
+            --limit "$${DELIVERY_RUN_LIMIT}";
+          sleep "$${DELIVERY_RUN_INTERVAL_SECONDS}";
+        done
+
   cli-job:
     image: ghcr.io/uta8a/kodamapub-cli-job:${KODAMAPUB_IMAGE_TAG:-latest}
     restart: "no"
