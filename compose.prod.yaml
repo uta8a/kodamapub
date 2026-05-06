@@ -1,0 +1,66 @@
+services:
+  edge:
+    image: ghcr.io/uta8a/kodamapub-edge:${KODAMAPUB_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      # 本番では HTTP と HTTPS を分ける
+      EDGE_HTTP_LISTEN_ADDR: 0.0.0.0:80
+      EDGE_HTTPS_LISTEN_ADDR: 0.0.0.0:443
+
+      # Let's Encrypt / certbot が作る証明書
+      EDGE_TLS_CERT_PATH: /etc/letsencrypt/live/${KODAMAPUB_DOMAIN:?set KODAMAPUB_DOMAIN}/fullchain.pem
+      EDGE_TLS_KEY_PATH: /etc/letsencrypt/live/${KODAMAPUB_DOMAIN:?set KODAMAPUB_DOMAIN}/privkey.pem
+
+      RUST_LOG: info
+
+      UPSTREAM_WEB_ADDR: web:5173
+      UPSTREAM_WEB_HOST: web
+      UPSTREAM_ADDR: server:3000
+      UPSTREAM_HOST: server
+
+    depends_on:
+      - server
+      - web
+
+    ports:
+      - "80:80"
+      - "443:443"
+
+    volumes:
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+
+  server:
+    image: ghcr.io/uta8a/kodamapub-server:${KODAMAPUB_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      BIND_ADDR: 0.0.0.0:3000
+      DATABASE_URL: sqlite:///data/kodamapub.db?mode=rwc
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?set PUBLIC_BASE_URL to the public https origin}
+    expose:
+      - "3000"
+    volumes:
+      - server-data:/data
+
+  web:
+    image: ghcr.io/uta8a/kodamapub-web:${KODAMAPUB_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      API_ORIGIN: http://server:3000
+      PORT: "5173"
+    depends_on:
+      - server
+    expose:
+      - "5173"
+
+  cli-job:
+    image: ghcr.io/uta8a/kodamapub-cli-job:${KODAMAPUB_IMAGE_TAG:-latest}
+    restart: "no"
+    profiles:
+      - cli
+    environment:
+      DATABASE_URL: sqlite:///data/kodamapub.db?mode=rwc
+    volumes:
+      - server-data:/data
+
+volumes:
+  server-data:

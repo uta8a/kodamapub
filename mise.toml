@@ -1,0 +1,34 @@
+[tasks.compose-up]
+description = "Start the local docker compose stack"
+run = "env PUBLIC_BASE_URL=https://app.localhost docker compose up --build"
+
+[tasks.compose-down]
+description = "Stop the local docker compose stack"
+run = "docker compose down -v"
+
+[tasks.compose-logs]
+description = "Follow docker compose logs"
+run = "docker compose logs -f --tail=200"
+
+[tasks.web-install]
+description = "Install web dependencies"
+run = "npm install --prefix apps/web --cache /tmp/kodamapub-npm-cache"
+
+[tasks.fmt-rust]
+description = "Format Rust crates"
+run = "cargo fmt"
+
+[tasks.fmt-web]
+description = "Format apps/web"
+run = "npm run format --prefix apps/web"
+
+[tasks.fmt]
+description = "Format Rust crates and apps/web"
+run = """
+mise run fmt-rust
+mise run fmt-web
+"""
+
+[tasks.seed-demo]
+description = "Seed demo user and posts into the running docker compose stack"
+run = "docker compose exec -T server cargo run -p kodamapub-cli -- seed-demo"

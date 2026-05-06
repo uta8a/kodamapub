@@ -1,0 +1,63 @@
+services:
+  edge:
+    build:
+      context: .
+      dockerfile: scripts/docker/edge.Dockerfile
+    restart: unless-stopped
+    environment:
+      EDGE_LISTEN_ADDR: 0.0.0.0:443
+      RUST_LOG: info
+      UPSTREAM_WEB_ADDR: web:5173
+      UPSTREAM_WEB_HOST: web
+      UPSTREAM_ADDR: server:3000
+      UPSTREAM_HOST: server
+    depends_on:
+      - server
+      - web
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./tmp/certs:/certs:ro
+    expose:
+      - "8080"
+
+  server:
+    build:
+      context: .
+      dockerfile: scripts/docker/server.Dockerfile
+    restart: unless-stopped
+    environment:
+      BIND_ADDR: 0.0.0.0:3000
+      DATABASE_URL: sqlite:///data/kodamapub.db?mode=rwc
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?set PUBLIC_BASE_URL to the public https origin}
+    expose:
+      - "3000"
+    volumes:
+      - server-data:/data
+
+  web:
+    build:
+      context: .
+      dockerfile: scripts/docker/web.Dockerfile
+    restart: unless-stopped
+    environment:
+      API_ORIGIN: http://server:3000
+      PORT: "5173"
+    depends_on:
+      - server
+    expose:
+      - "5173"
+
+  cli-job:
+    build:
+      context: .
+      dockerfile: scripts/docker/cli-job.Dockerfile
+    restart: "no"
+    environment:
+      DATABASE_URL: sqlite:///data/kodamapub.db?mode=rwc
+    volumes:
+      - server-data:/data
+
+volumes:
+  server-data:

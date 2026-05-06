@@ -1,0 +1,81 @@
+[workspace]
+members = [
+  "crates/server",
+  "crates/domain",
+  "crates/activitypub",
+  "crates/db",
+  "crates/job",
+  "crates/media",
+  "crates/cli",
+  "crates/edge",
+]
+resolver = "2"
+
+[workspace.package]
+authors = ["Masanori Tani"]
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+repository = "https://github.com/uta8a/kodamapub"
+rust-version = "1.95"
+
+[workspace.dependencies]
+# internal crates
+kodamapub-activitypub = {path = "crates/activitypub"}
+kodamapub-db = {path = "crates/db"}
+kodamapub-domain = {path = "crates/domain"}
+kodamapub-job = {path = "crates/job"}
+kodamapub-media = {path = "crates/media"}
+
+# async / web
+async-trait = "0.1"
+axum = {version = "0.8", features = ["macros", "json"]}
+http = "1"
+hyper = "1"
+tokio = {version = "1", features = ["full"]}
+tower = "0.5"
+tower-http = {version = "0.6", features = ["trace", "cors", "compression-br", "fs", "set-header"]}
+
+# serialization
+serde = {version = "1", features = ["derive"]}
+serde_json = "1"
+serde_with = "3"
+
+# db
+sqlx = {version = "0.8", features = ["runtime-tokio", "sqlite", "uuid", "chrono", "json", "migrate"]}
+
+# error / logging
+anyhow = "1"
+env_logger = "0.11"
+log = "0.4"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = {version = "0.3", features = ["env-filter", "json"]}
+
+# config
+config = "0.15"
+dotenvy = "0.15"
+
+# time / id / url
+chrono = {version = "0.4", features = ["serde"]}
+url = {version = "2", features = ["serde"]}
+uuid = {version = "1", features = ["v7", "serde"]}
+
+# crypto / signature
+argon2 = "0.5"
+base64 = "0.22"
+pem = "3"
+rsa = "0.9"
+sha2 = "0.10"
+
+# http client
+reqwest = {version = "0.13", features = ["json", "rustls"], default-features = false}
+
+# cli
+clap = {version = "4", features = ["derive", "env"]}
+
+# proxy
+pingora = {version = "0.8", features = ["proxy", "openssl"]}
+
+# tests
+pretty_assertions = "1"
