@@ -280,9 +280,9 @@ main() {
 
   trap 'status=$?; if [ "$status" -ne 0 ]; then compose logs --no-color --timestamps server mastodon-web mastodon-sidekiq mastodon-db mastodon-redis >&2 || true; fi; compose down -v --remove-orphans >/dev/null 2>&1 || true; exit "$status"' EXIT
 
-  compose up -d --build mastodon-db mastodon-redis edge server web >/dev/null
+  compose up -d mastodon-db mastodon-redis edge server web >/dev/null
   compose run --rm --no-deps mastodon-web bundle exec rails db:migrate >/dev/null
-  compose up -d --build mastodon-web mastodon-sidekiq >/dev/null
+  compose up -d mastodon-web mastodon-sidekiq >/dev/null
 
   wait_for_http https://127.0.0.1/api/health "kodamapub server via edge"
   wait_for_http http://127.0.0.1:3001/api/v1/instance "mastodon instance"
