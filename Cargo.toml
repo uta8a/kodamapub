@@ -59,14 +59,14 @@ dotenvy = "0.15"
 # time / id / url
 chrono = {version = "0.4", features = ["serde"]}
 url = {version = "2", features = ["serde"]}
-uuid = {version = "1", features = ["v7", "serde"]}
+uuid = {version = "1", features = ["v5", "v7", "serde"]}
 
 # crypto / signature
 argon2 = "0.5"
 base64 = "0.22"
 pem = "3"
 rsa = "0.9"
-sha2 = "0.10"
+sha2 = {version = "0.10", features = ["oid"]}
 
 # http client
 reqwest = {version = "0.13", features = ["json", "rustls"], default-features = false}

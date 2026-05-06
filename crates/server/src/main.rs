@@ -5,7 +5,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{Duration as ChronoDuration, Utc};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
@@ -14,6 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use chrono::{Duration as ChronoDuration, Utc};
 use kodamapub_activitypub::{
     IncomingActivity, fetch_remote_actor, is_publicly_visible, local_actor_to_object,
     ordered_collection, ordered_collection_page, parse_incoming_activity, post_to_create_activity,
@@ -22,16 +22,16 @@ use kodamapub_activitypub::{
 };
 use kodamapub_db::{Database, DbError};
 use kodamapub_domain::{
-    ActorProfile, ContentFormat, ContentSource, DomainError, LocalActor, NewPost, Post, PostId,
-    PublicBaseUrl, Username, Visibility,
+    ActorProfile, ContentFormat, ContentSource, DomainError, FollowRelation, LocalActor, NewPost,
+    Post, PostId, PublicBaseUrl, Username, Visibility,
 };
-use kodamapub_job::{JobError, RetryPolicy, enqueue_create_deliveries};
+use kodamapub_job::{JobError, RetryPolicy, activate_follow_and_backfill, enqueue_create_deliveries};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower::ServiceBuilder;
 use tower_http::set_header::SetResponseHeaderLayer;
-use uuid::Uuid;
 use url::Url;
+use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
@@ -211,9 +211,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         match self {
             ApiError::NotFound(message) => (StatusCode::NOT_FOUND, message).into_response(),
-            ApiError::Unauthorized(message) => {
-                (StatusCode::UNAUTHORIZED, message).into_response()
-            }
+            ApiError::Unauthorized(message) => (StatusCode::UNAUTHORIZED, message).into_response(),
             ApiError::Forbidden(message) => (StatusCode::FORBIDDEN, message).into_response(),
             ApiError::TooManyRequests {
                 message,
@@ -224,9 +222,7 @@ impl IntoResponse for ApiError {
                     if let Ok(value) =
                         HeaderValue::from_str(&retry_after.as_secs().max(1).to_string())
                     {
-                        response
-                            .headers_mut()
-                            .insert(header::RETRY_AFTER, value);
+                        response.headers_mut().insert(header::RETRY_AFTER, value);
                     }
                 }
                 response
@@ -322,7 +318,11 @@ async fn create_user_post(
     state
         .rate_limiter
         .check(
-            format!("create-post:{}:{}", client_rate_key(&headers), path.username),
+            format!(
+                "create-post:{}:{}",
+                client_rate_key(&headers),
+                path.username
+            ),
             RateLimitSpec {
                 limit: 60,
                 window: Duration::from_secs(60),
@@ -564,7 +564,7 @@ async fn post_logout(
         HeaderValue::from_str(&clear_session_cookie(
             state.public_base_url.as_str().starts_with("https://"),
         ))
-            .map_err(|error| ApiError::BadRequest(error.to_string()))?,
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?,
     );
     Ok(response)
 }
@@ -573,8 +573,8 @@ async fn require_authenticated_session(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<kodamapub_db::SessionRecord, ApiError> {
-    let token = session_token_from_headers(headers)
-        .ok_or(ApiError::Unauthorized("session is required"))?;
+    let token =
+        session_token_from_headers(headers).ok_or(ApiError::Unauthorized("session is required"))?;
     let Some(session) = state.db.sessions().find(&token).await? else {
         return Err(ApiError::Unauthorized("session is required"));
     };
@@ -583,13 +583,16 @@ async fn require_authenticated_session(
 }
 
 fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
-    headers.get(header::COOKIE).and_then(|value| value.to_str().ok()).and_then(|cookies| {
-        cookies
-            .split(';')
-            .map(str::trim)
-            .find_map(|cookie| cookie.strip_prefix(&format!("{SESSION_COOKIE_NAME}=")))
-            .map(str::to_string)
-    })
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| {
+            cookies
+                .split(';')
+                .map(str::trim)
+                .find_map(|cookie| cookie.strip_prefix(&format!("{SESSION_COOKIE_NAME}=")))
+                .map(str::to_string)
+        })
 }
 
 fn session_response(
@@ -613,7 +616,10 @@ fn build_session_cookie(
     expires_at: chrono::DateTime<Utc>,
     secure: bool,
 ) -> Result<String, ApiError> {
-    let max_age = expires_at.signed_duration_since(Utc::now()).num_seconds().max(0);
+    let max_age = expires_at
+        .signed_duration_since(Utc::now())
+        .num_seconds()
+        .max(0);
     let secure_flag = if secure { "; Secure" } else { "" };
     Ok(format!(
         "{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure_flag}"
@@ -633,8 +639,14 @@ fn ensure_csrf_token(headers: &HeaderMap, expected: &str) -> Result<(), ApiError
     Ok(())
 }
 
-fn ensure_same_origin(headers: &HeaderMap, public_base_url: &PublicBaseUrl) -> Result<(), ApiError> {
-    let Some(origin) = headers.get(header::ORIGIN).and_then(|value| value.to_str().ok()) else {
+fn ensure_same_origin(
+    headers: &HeaderMap,
+    public_base_url: &PublicBaseUrl,
+) -> Result<(), ApiError> {
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
         return Err(ApiError::Forbidden("origin is required"));
     };
 
@@ -671,9 +683,7 @@ fn client_rate_key(headers: &HeaderMap) -> String {
 
 fn clear_session_cookie(secure: bool) -> String {
     let secure_flag = if secure { "; Secure" } else { "" };
-    format!(
-        "{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure_flag}"
-    )
+    format!("{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure_flag}")
 }
 
 async fn post_inbox(
@@ -724,10 +734,34 @@ async fn post_inbox(
     let remote_actor = fetch_remote_actor(state.remote_client(), &key_actor_url).await?;
     state.db.remote_actors().upsert(&remote_actor).await?;
 
-    let signature_target = uri
-        .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or_else(|| uri.path());
+    let signature_target = headers
+        .get("x-original-uri")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_else(|| {
+            uri.path_and_query()
+                .map(|value| value.as_str())
+                .unwrap_or_else(|| uri.path())
+        });
+    eprintln!(
+        "verifying inbound activity signature original_host={} forwarded_host={} host={} original_uri={} request_uri={}",
+        headers
+            .get("x-original-host")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-"),
+        headers
+            .get("x-forwarded-host")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-"),
+        headers
+            .get("Host")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-"),
+        headers
+            .get("x-original-uri")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-"),
+        signature_target
+    );
     verify_incoming_activity_signature(
         &headers,
         method.as_str(),
@@ -755,7 +789,10 @@ async fn post_inbox(
         IncomingActivity::Create(create) => {
             handle_create_activity(&state, &remote_actor, create).await?;
         }
-        IncomingActivity::Accept(_) | IncomingActivity::Undo(_) | IncomingActivity::Delete(_) => {}
+        IncomingActivity::Accept(accept) => {
+            handle_accept_activity(&state, &local_actor, &remote_actor, accept).await?;
+        }
+        IncomingActivity::Undo(_) | IncomingActivity::Delete(_) => {}
     }
 
     Ok(StatusCode::ACCEPTED)
@@ -875,6 +912,20 @@ fn jrd_response<T: serde::Serialize>(value: &T) -> Result<Response, ApiError> {
     Ok(response)
 }
 
+fn build_remote_client() -> reqwest::Client {
+    let mut builder = reqwest::Client::builder();
+
+    if let Ok(ca_cert_path) = std::env::var("KODAMAPUB_REMOTE_CA_CERT_PATH") {
+        if let Ok(ca_pem) = std::fs::read(&ca_cert_path) {
+            if let Ok(ca_cert) = reqwest::Certificate::from_pem(&ca_pem) {
+                builder = builder.add_root_certificate(ca_cert);
+            }
+        }
+    }
+
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
@@ -893,7 +944,7 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         db,
         public_base_url,
-        remote_client: reqwest::Client::new(),
+        remote_client: build_remote_client(),
         rate_limiter: RateLimiter::new(),
     });
     let config = ServerConfig {
@@ -921,6 +972,12 @@ async fn handle_follow_activity(
         return Ok(());
     }
 
+    state
+        .db
+        .follows()
+        .upsert(&FollowRelation::new(local_actor.id(), remote_actor))
+        .await?;
+
     let job = kodamapub_job::enqueue_accept_delivery(
         &state.db,
         local_actor,
@@ -929,7 +986,31 @@ async fn handle_follow_activity(
         &RetryPolicy::default(),
     )
     .await?;
-    tracing::info!(job_id = %job.id.0, "queued accept delivery for inbound follow");
+    tracing::info!(
+        job_id = %job.id.0,
+        follow_id = %follow.id,
+        local_actor = %local_actor.profile.actor_url,
+        remote_actor = %remote_actor.profile.actor_url,
+        "queued accept delivery for inbound follow"
+    );
+    Ok(())
+}
+
+async fn handle_accept_activity(
+    state: &AppState,
+    local_actor: &kodamapub_domain::LocalActor,
+    remote_actor: &kodamapub_domain::RemoteActor,
+    accept: kodamapub_activitypub::IncomingAcceptActivity,
+) -> Result<(), ApiError> {
+    tracing::info!(
+        local_actor = %local_actor.profile.actor_url,
+        remote_actor = %remote_actor.profile.actor_url,
+        accept_id = %accept.id,
+        object = %accept.object,
+        "received inbound accept activity"
+    );
+
+    activate_follow_and_backfill(&state.db, local_actor, remote_actor).await?;
     Ok(())
 }
 
@@ -1110,7 +1191,7 @@ mod tests {
         let state = Arc::new(AppState {
             db,
             public_base_url: "https://example.invalid".parse().expect("public base url"),
-            remote_client: reqwest::Client::new(),
+            remote_client: build_remote_client(),
             rate_limiter: RateLimiter::new(),
         });
 
@@ -1303,6 +1384,9 @@ mod tests {
             .await
             .expect("body");
         let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
-        assert_eq!(json["links"][0]["href"], "https://example.invalid/users/alice");
+        assert_eq!(
+            json["links"][0]["href"],
+            "https://example.invalid/users/alice"
+        );
     }
 }

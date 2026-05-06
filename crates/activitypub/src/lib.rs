@@ -2,7 +2,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use http::HeaderMap;
 use kodamapub_domain::{
-    ActorProfile, DeliveryKind, LocalActor, Post, PostId, RemoteActor, Visibility,
+    ActorId, ActorProfile, DeliveryKind, LocalActor, Post, PostId, RemoteActor, Visibility,
 };
 use reqwest::{
     Client,
@@ -217,6 +217,12 @@ pub enum IncomingActivity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncomingActivityObject {
+    Url(Url),
+    ObjectId(Url),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncomingFollowActivity {
     pub id: Url,
     pub actor: Url,
@@ -241,7 +247,7 @@ pub struct IncomingAcceptActivity {
 pub struct IncomingUndoActivity {
     pub id: Url,
     pub actor: Url,
-    pub object: Url,
+    pub object: IncomingActivityObject,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,19 +370,27 @@ pub async fn fetch_remote_actor(
     let summary = actor_json
         .summary
         .as_deref()
-        .map(|value| value.parse::<kodamapub_domain::Summary>())
+        .and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.parse::<kodamapub_domain::Summary>())
+            }
+        })
         .transpose()
         .map_err(|error| ActivityPubError::InvalidResource(error.to_string()))?;
 
     Ok(RemoteActor {
-        profile: ActorProfile::new(
+        profile: ActorProfile {
+            id: ActorId::from_stable_name(actor_id.as_str()),
             username,
             display_name,
             summary,
-            actor_id,
-            actor_json.inbox,
-            actor_json.outbox,
-        ),
+            actor_url: actor_id,
+            inbox_url: actor_json.inbox,
+            outbox_url: actor_json.outbox,
+        },
         public_key_pem: actor_json.public_key.map(|key| key.public_key_pem),
         fetched_at: Utc::now(),
     })
@@ -389,6 +403,23 @@ pub async fn deliver_signed_activity(
     body: &str,
 ) -> Result<(), ActivityPubError> {
     let headers = signed_headers(actor, "post", target_inbox_url, body)?;
+    let host = headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("<invalid-host>");
+    let digest = headers
+        .get("Digest")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("<invalid-digest>");
+    let signature = headers
+        .get("Signature")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("<invalid-signature>");
+
+    eprintln!(
+        "delivering signed activity target={} host={} digest={} signature={}",
+        target_inbox_url, host, digest, signature
+    );
 
     client
         .post(target_inbox_url.clone())
@@ -587,7 +618,7 @@ pub fn parse_incoming_activity(body: &str) -> Result<IncomingActivity, ActivityP
         "Follow" => Ok(IncomingActivity::Follow(IncomingFollowActivity {
             id,
             actor,
-            object: parse_url_field(&value, "object")?,
+            object: parse_activity_object_url_field(&value, "object")?,
         })),
         "Create" => Ok(IncomingActivity::Create(IncomingCreateActivity {
             id,
@@ -599,17 +630,19 @@ pub fn parse_incoming_activity(body: &str) -> Result<IncomingActivity, ActivityP
         "Accept" => Ok(IncomingActivity::Accept(IncomingAcceptActivity {
             id,
             actor,
-            object: parse_url_field(&value, "object")?,
+            object: parse_activity_object_url_field(&value, "object")?,
         })),
         "Undo" => Ok(IncomingActivity::Undo(IncomingUndoActivity {
             id,
             actor,
-            object: parse_url_field(&value, "object")?,
+            object: parse_incoming_object_reference(value.get("object").ok_or_else(|| {
+                ActivityPubError::InvalidResource("activity missing object".to_string())
+            })?)?,
         })),
         "Delete" => Ok(IncomingActivity::Delete(IncomingDeleteActivity {
             id,
             actor,
-            object: parse_url_field(&value, "object")?,
+            object: parse_activity_object_url_field(&value, "object")?,
         })),
         other => Err(ActivityPubError::InvalidResource(format!(
             "unsupported activity type {other}"
@@ -649,6 +682,40 @@ pub fn verify_incoming_activity_signature(
     let signature = header_map
         .get("signature")
         .ok_or_else(|| ActivityPubError::InvalidSignatureHeader("missing signature".to_string()))?;
+    let key_id_url = key_id
+        .parse::<Url>()
+        .map_err(|error: url::ParseError| ActivityPubError::InvalidSignatureHeader(error.to_string()))?;
+    let key_id_host = key_id_url.host_str().map(|host| match key_id_url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    });
+    let signature_host = signature_host_header(headers)?;
+    let mut candidate_hosts = host_candidates(&signature_host);
+    if let Some(key_id_host) = key_id_host {
+        candidate_hosts.extend(host_candidates(&key_id_host));
+    }
+    candidate_hosts.sort();
+    candidate_hosts.dedup();
+
+    eprintln!(
+        "incoming signature raw key_id={} headers={} signature_header={} digest_header={} method={} request_target={} host={} date={}",
+        key_id,
+        headers_list,
+        signature,
+        digest_header,
+        method,
+        request_target,
+        headers
+            .get("x-original-host")
+            .and_then(|value| value.to_str().ok())
+            .or_else(|| headers.get("x-forwarded-host").and_then(|value| value.to_str().ok()))
+            .or_else(|| headers.get("Host").and_then(|value| value.to_str().ok()))
+            .unwrap_or("-"),
+        headers
+            .get("Date")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-")
+    );
 
     let expected_digest = digest_header_value(
         std::str::from_utf8(body)
@@ -658,17 +725,8 @@ pub fn verify_incoming_activity_signature(
         return Err(ActivityPubError::SignatureVerificationFailed);
     }
 
-    let signing_string = canonical_signature_string(
-        headers,
-        method,
-        request_target,
-        &headers_list,
-        digest_header,
-    )?;
-
     let public_key = RsaPublicKey::from_public_key_pem(public_key_pem)
         .map_err(|error| ActivityPubError::Signing(error.to_string()))?;
-    let verifying_key = VerifyingKey::<Sha256>::new_unprefixed(public_key);
     let signature = rsa::pkcs1v15::Signature::try_from(
         STANDARD
             .decode(signature)
@@ -680,12 +738,30 @@ pub fn verify_incoming_activity_signature(
     .map_err(|error: rsa::signature::Error| {
         ActivityPubError::InvalidSignatureHeader(error.to_string())
     })?;
-    verifying_key
-        .verify(signing_string.as_bytes(), &signature)
-        .map_err(|_| ActivityPubError::SignatureVerificationFailed)?;
+    for candidate_host in candidate_hosts {
+        let signing_string = canonical_signature_string(
+            headers,
+            method,
+            request_target,
+            &headers_list,
+            digest_header,
+            Some(&candidate_host),
+        )?;
+        eprintln!(
+            "incoming signature key_id={} headers={} candidate_host={} signing_string={}",
+            key_id,
+            headers_list,
+            candidate_host,
+            signing_string
+        );
+
+        if verifying_key_matches(&public_key, &signing_string, &signature) {
+            return Ok(());
+        }
+    }
 
     let _ = key_id;
-    Ok(())
+    Err(ActivityPubError::SignatureVerificationFailed)
 }
 
 pub fn signature_key_id_actor_url(headers: &HeaderMap) -> Result<Url, ActivityPubError> {
@@ -728,6 +804,7 @@ fn canonical_signature_string(
     request_target: &str,
     headers_list: &str,
     digest_header: &str,
+    host_override: Option<&str>,
 ) -> Result<String, ActivityPubError> {
     let mut lines = Vec::new();
     for header_name in headers_list.split_whitespace() {
@@ -740,13 +817,9 @@ fn canonical_signature_string(
                 ));
             }
             "host" => {
-                let value = headers
-                    .get("Host")
-                    .ok_or_else(|| {
-                        ActivityPubError::InvalidSignatureHeader("missing host".to_string())
-                    })?
-                    .to_str()
-                    .map_err(|error| ActivityPubError::InvalidSignatureHeader(error.to_string()))?;
+                let value = host_override
+                    .map(|value| value.to_string())
+                    .unwrap_or(signature_host_header(headers)?);
                 lines.push(format!("host: {value}"));
             }
             "date" => {
@@ -776,6 +849,50 @@ fn canonical_signature_string(
     Ok(lines.join("\n"))
 }
 
+fn verifying_key_matches(
+    public_key: &RsaPublicKey,
+    signing_string: &str,
+    signature: &rsa::pkcs1v15::Signature,
+) -> bool {
+    let prefixed = VerifyingKey::<Sha256>::new(public_key.clone());
+    if prefixed.verify(signing_string.as_bytes(), signature).is_ok() {
+        return true;
+    }
+
+    let unprefixed = VerifyingKey::<Sha256>::new_unprefixed(public_key.clone());
+    unprefixed.verify(signing_string.as_bytes(), signature).is_ok()
+}
+
+fn signature_host_header(headers: &HeaderMap) -> Result<String, ActivityPubError> {
+    for header_name in ["x-original-host", "x-forwarded-host", "Host"] {
+        if let Some(value) = headers.get(header_name) {
+            return value.to_str().map(|value| value.to_string()).map_err(|error| {
+                ActivityPubError::InvalidSignatureHeader(error.to_string())
+            });
+        }
+    }
+
+    Err(ActivityPubError::InvalidSignatureHeader(
+        "missing host".to_string(),
+    ))
+}
+
+fn host_candidates(host: &str) -> Vec<String> {
+    let mut candidates = vec![host.to_string()];
+
+    if let Ok(parsed) = Url::parse(&format!("https://{host}")) {
+        if let Some(host_str) = parsed.host_str() {
+            candidates.push(host_str.to_string());
+            if parsed.port().is_none() {
+                candidates.push(format!("{host_str}:443"));
+                candidates.push(format!("{host_str}:80"));
+            }
+        }
+    }
+
+    candidates
+}
+
 fn parse_url_field(value: &serde_json::Value, field: &str) -> Result<Url, ActivityPubError> {
     let raw = value
         .get(field)
@@ -783,6 +900,38 @@ fn parse_url_field(value: &serde_json::Value, field: &str) -> Result<Url, Activi
         .ok_or_else(|| ActivityPubError::InvalidResource(format!("activity missing {field}")))?;
     raw.parse::<Url>()
         .map_err(|error: url::ParseError| ActivityPubError::InvalidResource(error.to_string()))
+}
+
+fn parse_activity_object_url_field(
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<Url, ActivityPubError> {
+    let Some(raw) = value.get(field) else {
+        return Err(ActivityPubError::InvalidResource(format!(
+            "activity missing {field}"
+        )));
+    };
+
+    if let Some(url) = raw.as_str() {
+        return url
+            .parse::<Url>()
+            .map_err(|error: url::ParseError| ActivityPubError::InvalidResource(error.to_string()));
+    }
+
+    parse_url_field(raw, "id")
+}
+
+fn parse_incoming_object_reference(
+    value: &serde_json::Value,
+) -> Result<IncomingActivityObject, ActivityPubError> {
+    if let Some(url) = value.as_str() {
+        return url
+            .parse::<Url>()
+            .map(IncomingActivityObject::Url)
+            .map_err(|error: url::ParseError| ActivityPubError::InvalidResource(error.to_string()));
+    }
+
+    parse_url_field(value, "id").map(IncomingActivityObject::ObjectId)
 }
 
 fn parse_url_list(value: Option<&serde_json::Value>) -> Result<Vec<Url>, ActivityPubError> {
@@ -864,7 +1013,7 @@ fn signed_headers(
         None => url.path().to_string(),
     };
     let signing_string = format!(
-        "(request-target): {} {}\nhost: {}\ndate: {}\ndigest: {}",
+        "(request-target): {} {}\nhost: {}\ndate: {}\ndigest: {}\ncontent-type: application/activity+json",
         method.to_ascii_lowercase(),
         path,
         host,
@@ -874,10 +1023,10 @@ fn signed_headers(
 
     let private_key = RsaPrivateKey::from_pkcs8_pem(&actor.private_key_pem)
         .map_err(|error| ActivityPubError::Signing(error.to_string()))?;
-    let signing_key = SigningKey::<Sha256>::new_unprefixed(private_key);
+    let signing_key = SigningKey::<Sha256>::new(private_key);
     let signature = signing_key.sign_with_rng(&mut OsRng, signing_string.as_bytes());
     let signature_header = format!(
-        "keyId=\"{}\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date digest\",signature=\"{}\"",
+        "keyId=\"{}\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date digest content-type\",signature=\"{}\"",
         key_id_url(&actor.profile.actor_url),
         STANDARD.encode(signature.to_vec())
     );
@@ -929,6 +1078,7 @@ fn webfinger_url_for_host(host: &str, resource: &str) -> Result<Url, ActivityPub
     let scheme = if host.starts_with("localhost")
         || host.starts_with("127.0.0.1")
         || host.starts_with("[::1]")
+        || host.starts_with("host.docker.internal")
     {
         "http"
     } else {
@@ -949,7 +1099,6 @@ fn host_header_value(url: &Url) -> Result<String, ActivityPubError> {
     let host = url
         .host_str()
         .ok_or_else(|| ActivityPubError::InvalidResource(url.to_string()))?;
-
     Ok(match url.port() {
         Some(port) => format!("{host}:{port}"),
         None => host.to_string(),
@@ -1145,6 +1294,36 @@ mod tests {
         assert_eq!(activity.object, remote_actor.profile.actor_url);
     }
 
+    #[test]
+    fn parse_undo_activity_accepts_embedded_follow_object() {
+        let body = serde_json::json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "id": "https://remote.example/activities/undo-1",
+            "type": "Undo",
+            "actor": "https://remote.example/users/bob",
+            "object": {
+                "id": "https://remote.example/activities/follow-1",
+                "type": "Follow",
+                "actor": "https://remote.example/users/bob",
+                "object": "https://example.invalid/users/alice"
+            }
+        })
+        .to_string();
+
+        let activity = parse_incoming_activity(&body).expect("parse undo activity");
+
+        match activity {
+            IncomingActivity::Undo(value) => match value.object {
+                IncomingActivityObject::ObjectId(url) => assert_eq!(
+                    url.as_str(),
+                    "https://remote.example/activities/follow-1"
+                ),
+                IncomingActivityObject::Url(_) => panic!("expected embedded activity id"),
+            },
+            other => panic!("unexpected activity: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn discovers_remote_actor_from_webfinger_and_actor_json() {
         async fn webfinger(Query(query): Query<HashMap<String, String>>) -> impl IntoResponse {
@@ -1252,5 +1431,36 @@ mod tests {
         assert!(requests[0].1.contains("\"type\":\"Follow\""));
 
         server.abort();
+    }
+
+    #[test]
+    fn verify_incoming_signature_prefers_forwarded_host() {
+        let actor = sample_local_actor();
+        let body = serde_json::json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "id": "https://remote.example/activities/follow-1",
+            "type": "Follow",
+            "actor": "https://remote.example/users/bob",
+            "object": "https://example.invalid/users/alice"
+        })
+        .to_string();
+        let target = Url::parse("https://mastodon.e2e:3001/users/alice/inbox")
+            .expect("target inbox url");
+
+        let mut headers = signed_headers(&actor, "post", &target, &body).expect("sign headers");
+        headers.insert(HOST, HeaderValue::from_static("server"));
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("mastodon.e2e:3001"),
+        );
+
+        verify_incoming_activity_signature(
+            &headers,
+            "POST",
+            "/users/alice/inbox",
+            body.as_bytes(),
+            &actor.public_key_pem,
+        )
+        .expect("verify signature");
     }
 }

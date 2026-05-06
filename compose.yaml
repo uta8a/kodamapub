@@ -1,5 +1,6 @@
 services:
   edge:
+    image: kodamapub-edge
     build:
       context: .
       dockerfile: scripts/docker/edge.Dockerfile
@@ -23,6 +24,7 @@ services:
       - "8080"
 
   server:
+    image: kodamapub-server
     build:
       context: .
       dockerfile: scripts/docker/server.Dockerfile
@@ -37,6 +39,7 @@ services:
       - server-data:/data
 
   web:
+    image: kodamapub-web
     build:
       context: .
       dockerfile: scripts/docker/web.Dockerfile
@@ -50,6 +53,7 @@ services:
       - "5173"
 
   cli-job:
+    image: kodamapub-cli-job
     build:
       context: .
       dockerfile: scripts/docker/cli-job.Dockerfile

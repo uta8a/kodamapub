@@ -115,6 +115,9 @@ impl ProxyHttp for KodamapubEdge {
             .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
         {
             upstream_request
+                .insert_header("x-original-host", host)
+                .ok();
+            upstream_request
                 .insert_header("x-forwarded-host", host)
                 .ok();
         }

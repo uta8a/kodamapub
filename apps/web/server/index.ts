@@ -45,10 +45,12 @@ function copyProxyHeaders(upstream: Response): Headers {
 }
 
 async function proxyToApi(request: Request, path: string): Promise<Response> {
+  const originalUrl = new URL(request.url);
   const headers: Record<string, string> = {
     accept: request.headers.get("accept") ?? "application/json",
     "content-type": request.headers.get("content-type") ?? "application/json",
     cookie: request.headers.get("cookie") ?? "",
+    "x-original-uri": `${originalUrl.pathname}${originalUrl.search}`,
   };
 
   for (const name of [
@@ -58,6 +60,7 @@ async function proxyToApi(request: Request, path: string): Promise<Response> {
     "digest",
     "signature",
     "x-csrf-token",
+    "x-original-host",
     "x-forwarded-for",
     "x-forwarded-host",
     "x-forwarded-proto",
