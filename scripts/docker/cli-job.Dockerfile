@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 FROM rust:1.95-bookworm AS builder
 
 RUN apt-get update \
@@ -13,12 +14,14 @@ WORKDIR /workspace
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY apps ./apps
-COPY scripts ./scripts
 
 ENV CARGO_HOME=/usr/local/cargo
 ENV RUST_BACKTRACE=1
 
-RUN cargo build --locked --release -p kodamapub-cli
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+  --mount=type=cache,target=/usr/local/cargo/git \
+  --mount=type=cache,target=/workspace/target \
+  cargo build --locked --release -p kodamapub-cli
 
 FROM debian:bookworm-slim AS runtime
 
