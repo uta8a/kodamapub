@@ -22,8 +22,8 @@ use kodamapub_activitypub::{
 };
 use kodamapub_db::{Database, DbError};
 use kodamapub_domain::{
-    ContentFormat, ContentSource, DomainError, NewPost, Post, PostId, PublicBaseUrl, Username,
-    Visibility,
+    ActorProfile, ContentFormat, ContentSource, DomainError, LocalActor, NewPost, Post, PostId,
+    PublicBaseUrl, Username, Visibility,
 };
 use kodamapub_job::{JobError, RetryPolicy, enqueue_create_deliveries};
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,7 @@ use tokio::sync::Mutex;
 use tower::ServiceBuilder;
 use tower_http::set_header::SetResponseHeaderLayer;
 use uuid::Uuid;
+use url::Url;
 
 #[derive(Clone)]
 struct AppState {
@@ -293,12 +294,7 @@ async fn list_user_posts(
     Path(path): Path<UsernamePath>,
     Query(query): Query<ListPostsQuery>,
 ) -> Result<Json<PostPageResponse>, ApiError> {
-    let actor = state
-        .db
-        .local_actors()
-        .find_by_username(&path.username)
-        .await?
-        .ok_or(ApiError::NotFound("local actor not found"))?;
+    let actor = find_local_actor_by_username(&state, &path.username).await?;
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
     let page = state
         .db
@@ -335,12 +331,7 @@ async fn create_user_post(
         .await?;
     ensure_csrf_token(&headers, &session.csrf_token)?;
 
-    let actor = state
-        .db
-        .local_actors()
-        .find_by_username(&path.username)
-        .await?
-        .ok_or(ApiError::NotFound("local actor not found"))?;
+    let actor = find_local_actor_by_username(&state, &path.username).await?;
 
     let post = Post::new(
         NewPost {
@@ -363,12 +354,7 @@ async fn get_actor(
     Path(path): Path<UsernamePath>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let actor = state
-        .db
-        .local_actors()
-        .find_by_username(&path.username)
-        .await?
-        .ok_or(ApiError::NotFound("local actor not found"))?;
+    let actor = find_local_actor_by_username(&state, &path.username).await?;
 
     if wants_activitypub(&headers) {
         return activitypub_response(&local_actor_to_object(&actor));
@@ -407,12 +393,7 @@ async fn get_outbox(
     Path(path): Path<UsernamePath>,
     Query(query): Query<OutboxQuery>,
 ) -> Result<Response, ApiError> {
-    let actor = state
-        .db
-        .local_actors()
-        .find_by_username(&path.username)
-        .await?
-        .ok_or(ApiError::NotFound("local actor not found"))?;
+    let actor = find_local_actor_by_username(&state, &path.username).await?;
     let outbox_url = actor
         .profile
         .outbox_url
@@ -494,12 +475,7 @@ async fn get_webfinger(
         .await?;
     let parsed = parse_webfinger_resource(&config.public_base_url, &query.resource)
         .ok_or_else(|| ApiError::BadRequest("invalid webfinger resource".to_string()))?;
-    let actor = state
-        .db
-        .local_actors()
-        .find_by_username(&parsed)
-        .await?
-        .ok_or(ApiError::NotFound("local actor not found"))?;
+    let actor = find_local_actor_by_username(&state, &parsed).await?;
 
     jrd_response(&webfinger_response(query.resource, actor.profile.actor_url))
 }
@@ -551,7 +527,7 @@ async fn post_login(
 
     let secure = state.public_base_url.as_str().starts_with("https://");
     session_response(
-        actor.profile,
+        canonical_local_actor_profile(&actor, &state.public_base_url)?,
         csrf_token,
         Some(build_session_cookie(&token, expires_at, secure)?),
     )
@@ -563,7 +539,11 @@ async fn get_session(
 ) -> Result<Response, ApiError> {
     let session = require_authenticated_session(&state, &headers).await?;
     let actor = find_local_actor_by_id(&state, session.actor_id).await?;
-    session_response(actor.profile, session.csrf_token, None)
+    session_response(
+        canonical_local_actor_profile(&actor, &state.public_base_url)?,
+        session.csrf_token,
+        None,
+    )
 }
 
 async fn post_logout(
@@ -785,12 +765,60 @@ async fn find_local_actor_by_id(
     state: &AppState,
     actor_id: kodamapub_domain::ActorId,
 ) -> Result<kodamapub_domain::LocalActor, ApiError> {
-    state
+    let actor = state
         .db
         .local_actors()
         .find_by_id(actor_id)
         .await?
-        .ok_or(ApiError::NotFound("local actor not found"))
+        .ok_or(ApiError::NotFound("local actor not found"))?;
+    canonicalize_local_actor(&actor, &state.public_base_url)
+}
+
+async fn find_local_actor_by_username(
+    state: &AppState,
+    username: &Username,
+) -> Result<kodamapub_domain::LocalActor, ApiError> {
+    let actor = state
+        .db
+        .local_actors()
+        .find_by_username(username)
+        .await?
+        .ok_or(ApiError::NotFound("local actor not found"))?;
+    canonicalize_local_actor(&actor, &state.public_base_url)
+}
+
+fn canonical_local_actor_profile(
+    actor: &LocalActor,
+    public_base_url: &PublicBaseUrl,
+) -> Result<ActorProfile, ApiError> {
+    Ok(canonicalize_local_actor(actor, public_base_url)?.profile)
+}
+
+fn canonicalize_local_actor(
+    actor: &LocalActor,
+    public_base_url: &PublicBaseUrl,
+) -> Result<LocalActor, ApiError> {
+    let base = public_base_url.as_str().trim_end_matches('/');
+    let actor_url = Url::parse(&format!("{base}/users/{}", actor.profile.username))
+        .map_err(|error| ApiError::Internal(anyhow::Error::new(error)))?;
+    let inbox_url = Url::parse(&format!("{base}/users/{}/inbox", actor.profile.username))
+        .map_err(|error| ApiError::Internal(anyhow::Error::new(error)))?;
+    let outbox_url = Url::parse(&format!("{base}/users/{}/outbox", actor.profile.username))
+        .map_err(|error| ApiError::Internal(anyhow::Error::new(error)))?;
+
+    Ok(LocalActor {
+        profile: ActorProfile {
+            id: actor.profile.id,
+            username: actor.profile.username.clone(),
+            display_name: actor.profile.display_name.clone(),
+            summary: actor.profile.summary.clone(),
+            actor_url,
+            inbox_url: Some(inbox_url),
+            outbox_url: Some(outbox_url),
+        },
+        public_key_pem: actor.public_key_pem.clone(),
+        private_key_pem: actor.private_key_pem.clone(),
+    })
 }
 
 fn wants_activitypub(headers: &HeaderMap) -> bool {
@@ -1033,14 +1061,18 @@ mod tests {
     }
 
     fn sample_local_actor() -> LocalActor {
+        sample_local_actor_at("https://example.invalid")
+    }
+
+    fn sample_local_actor_at(base: &str) -> LocalActor {
         LocalActor {
             profile: ActorProfile::new(
                 "alice".parse().expect("username"),
                 "Alice".parse().expect("display name"),
                 Some("summary".parse().expect("summary")),
-                Url::parse("https://example.invalid/users/alice").expect("actor url"),
-                Some(Url::parse("https://example.invalid/users/alice/inbox").expect("inbox url")),
-                Some(Url::parse("https://example.invalid/users/alice/outbox").expect("outbox url")),
+                Url::parse(&format!("{base}/users/alice")).expect("actor url"),
+                Some(Url::parse(&format!("{base}/users/alice/inbox")).expect("inbox url")),
+                Some(Url::parse(&format!("{base}/users/alice/outbox")).expect("outbox url")),
             ),
             public_key_pem: "PUBLIC KEY".to_string(),
             private_key_pem: "PRIVATE KEY".to_string(),
@@ -1048,8 +1080,11 @@ mod tests {
     }
 
     async fn test_app() -> Router {
+        test_app_with_actor(sample_local_actor()).await
+    }
+
+    async fn test_app_with_actor(actor: LocalActor) -> Router {
         let db = test_db().await;
-        let actor = sample_local_actor();
         db.local_actors()
             .create(&actor)
             .await
@@ -1247,5 +1282,27 @@ mod tests {
             json["links"][0]["href"],
             "https://example.invalid/users/alice"
         );
+    }
+
+    #[tokio::test]
+    async fn webfinger_normalizes_stale_local_actor_urls() {
+        let app = test_app_with_actor(sample_local_actor_at("http://127.0.0.1:3000")).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/.well-known/webfinger?resource=acct:alice@example.invalid")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["links"][0]["href"], "https://example.invalid/users/alice");
     }
 }
