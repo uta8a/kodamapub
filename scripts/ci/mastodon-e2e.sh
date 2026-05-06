@@ -35,7 +35,7 @@ wait_for_follow_state() {
       -H "Authorization: Bearer ${token}" \
       --get \
       --data-urlencode "id[]=${remote_id}" \
-      http://127.0.0.1/api/v1/accounts/relationships)"; then
+      http://127.0.0.1:3001/api/v1/accounts/relationships)"; then
       sleep 3
       continue
     fi
@@ -50,6 +50,38 @@ wait_for_follow_state() {
   done
 
   printf 'timed out waiting for relationship following=%s for account %s\n' "$expected" "$remote_id" >&2
+  return 1
+}
+
+wait_for_remote_post_content() {
+  local token="$1"
+  local remote_id="$2"
+  local expected_content="$3"
+  local attempt
+
+  for attempt in $(seq 1 40); do
+    local statuses
+    if ! statuses="$(
+      curl -fsS \
+        -H "Authorization: Bearer ${token}" \
+        --get \
+        --data-urlencode "limit=20" \
+        "http://127.0.0.1:3001/api/v1/accounts/${remote_id}/statuses"
+    )"; then
+      sleep 3
+      continue
+    fi
+
+    if jq -e --arg expected "${expected_content}" '
+      any(.[]; (.content // "") | contains($expected))
+    ' <<<"${statuses}" >/dev/null; then
+      return 0
+    fi
+
+    sleep 3
+  done
+
+  printf 'timed out waiting for mastodon to expose post content for account %s\n' "$remote_id" >&2
   return 1
 }
 
@@ -91,6 +123,44 @@ create_local_actor() {
     --password password >/dev/null
 }
 
+login_local_actor() {
+  local cookie_jar="$1"
+  local login_output
+
+  login_output="$(
+    curl -kfsS \
+      -c "${cookie_jar}" \
+      -H 'Origin: http://edge' \
+      -H 'Content-Type: application/json' \
+      -d '{
+        "username": "alice",
+        "password": "password"
+      }' \
+      https://127.0.0.1/api/login
+  )"
+
+  jq -r '.csrf_token' <<<"${login_output}"
+}
+
+create_local_post() {
+  local cookie_jar="$1"
+  local csrf_token="$2"
+  local content_source="$3"
+
+  curl -kfsS -X POST \
+    -b "${cookie_jar}" \
+    -H 'Origin: http://edge' \
+    -H "x-csrf-token: ${csrf_token}" \
+    -H 'Content-Type: application/json' \
+    -d "$(jq -nc --arg content_source "${content_source}" '{
+      content_source: $content_source,
+      content_format: "Plaintext",
+      visibility: "Public",
+      in_reply_to: null
+    }')" \
+    https://127.0.0.1/api/users/alice/posts >/dev/null
+}
+
 create_mastodon_app() {
   curl -fsS -X POST \
     -H 'Content-Type: application/json' \
@@ -100,7 +170,7 @@ create_mastodon_app() {
       "scopes": "read write",
       "website": "https://example.invalid"
     }' \
-    http://127.0.0.1/api/v1/apps
+    http://127.0.0.1:3001/api/v1/apps
 }
 
 create_mastodon_user() {
@@ -133,7 +203,7 @@ request_user_token() {
     --data-urlencode "username=e2e" \
     --data-urlencode "password=${password}" \
     --data-urlencode "scope=read write" \
-    http://127.0.0.1/oauth/token
+    http://127.0.0.1:3001/oauth/token
 }
 
 lookup_remote_account_id() {
@@ -145,7 +215,7 @@ lookup_remote_account_id() {
     --data-urlencode "q=alice@edge" \
     --data-urlencode "resolve=true" \
     --data-urlencode "limit=1" \
-    http://127.0.0.1/api/v1/accounts/search | jq -r '.[0].id'
+    http://127.0.0.1:3001/api/v1/accounts/search | jq -r '.[0].id'
 }
 
 follow_remote_account() {
@@ -154,7 +224,7 @@ follow_remote_account() {
 
   curl -fsS -X POST \
     -H "Authorization: Bearer ${token}" \
-    http://127.0.0.1/api/v1/accounts/"${remote_id}"/follow >/dev/null
+    http://127.0.0.1:3001/api/v1/accounts/"${remote_id}"/follow >/dev/null
 }
 
 unfollow_remote_account() {
@@ -163,7 +233,7 @@ unfollow_remote_account() {
 
   curl -fsS -X POST \
     -H "Authorization: Bearer ${token}" \
-    http://127.0.0.1/api/v1/accounts/"${remote_id}"/unfollow >/dev/null
+    http://127.0.0.1:3001/api/v1/accounts/"${remote_id}"/unfollow >/dev/null
 }
 
 run_delivery_jobs() {
@@ -183,6 +253,7 @@ assert_no_server_errors() {
 
 main() {
   local app_json client_id client_secret password user_token remote_account_id
+  local local_cookie_jar post_content csrf_token
 
   : "${PUBLIC_BASE_URL:=http://edge}"
   export PUBLIC_BASE_URL
@@ -198,6 +269,9 @@ main() {
   wait_for_http http://127.0.0.1:3001/api/v1/instance "mastodon instance"
 
   create_local_actor
+  local_cookie_jar="$(mktemp)"
+  post_content="Mastodon E2E kodamapub post"
+  csrf_token="$(login_local_actor "${local_cookie_jar}")"
 
   app_json="$(create_mastodon_app)"
   client_id="$(jq -r '.client_id' <<<"${app_json}")"
@@ -221,6 +295,13 @@ main() {
     follow_remote_account "${user_token}" "${remote_account_id}"
     run_delivery_jobs
     wait_for_follow_state true "${remote_account_id}" "${user_token}"
+
+    if [[ -z "${posted_once:-}" ]]; then
+      create_local_post "${local_cookie_jar}" "${csrf_token}" "${post_content}"
+      run_delivery_jobs
+      wait_for_remote_post_content "${user_token}" "${remote_account_id}" "${post_content}"
+      posted_once=true
+    fi
 
     unfollow_remote_account "${user_token}" "${remote_account_id}"
     wait_for_follow_state false "${remote_account_id}" "${user_token}"
