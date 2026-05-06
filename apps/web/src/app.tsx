@@ -24,6 +24,18 @@ const defaultUsername = import.meta.env.VITE_DEFAULT_USERNAME ?? "alice";
 
 type SessionStatus = "loading" | "anonymous" | "authenticated";
 
+const visibilityLabels: Record<Post["visibility"], string> = {
+  Public: "公開",
+  Unlisted: "限定公開",
+  Followers: "フォロワー",
+  Direct: "ダイレクト",
+};
+
+const contentFormatLabels: Record<Post["content_format"], string> = {
+  Plaintext: "プレーンテキスト",
+  Markdown: "マークダウン",
+};
+
 type SessionContextValue = {
   actor: ActorProfile | null;
   status: SessionStatus;
@@ -46,6 +58,14 @@ function formatDate(value: string): string {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(value));
+}
+
+function formatVisibility(value: Post["visibility"]): string {
+  return visibilityLabels[value];
+}
+
+function formatContentFormat(value: Post["content_format"]): string {
+  return contentFormatLabels[value];
 }
 
 function useSession() {
@@ -134,7 +154,8 @@ function AppShell({
           <span className="brand-mark">k</span>
           <span>
             <strong>kodamapub</strong>
-            <small>ActivityPub front-end</small>
+            <small>静かな ActivityPub フロントエンド</small>
+            <span className="brand-chip">local pub / notes</span>
           </span>
         </Link>
 
@@ -146,25 +167,25 @@ function AppShell({
         <div className="topbar-actions">
           {status === "loading" ? (
             <div className="session-pill">
-              <span>Session</span>
-              <strong>Checking...</strong>
+              <span>セッション</span>
+              <strong>確認中</strong>
             </div>
           ) : actor ? (
             <>
               <div className="session-pill">
-                <span>Signed in</span>
+                <span>ログイン中</span>
                 <strong>@{actor.username}</strong>
               </div>
               <Link className="secondary-button" to={profilePath(actor.username)}>
-                Profile
+                プロフィール
               </Link>
               <button className="secondary-button" type="button" onClick={() => void handleSignOut()}>
-                Sign out
+                ログアウト
               </button>
             </>
           ) : (
             <Link className="secondary-button" to="/login">
-              Sign in
+              ログイン
             </Link>
           )}
         </div>
@@ -181,13 +202,13 @@ function FeedCard({ post, username }: { post: Post; username: string }) {
   return (
     <article className="post-card">
       <div className="post-meta">
-        <span>{post.visibility}</span>
-        <span>{post.content_format}</span>
+        <span>{formatVisibility(post.visibility)}</span>
+        <span>{formatContentFormat(post.content_format)}</span>
         <time dateTime={post.created_at}>{formatDate(post.created_at)}</time>
       </div>
       <div className="post-body" dangerouslySetInnerHTML={body} />
       <div className="post-footer">
-        <Link to={postPath(username, post.id)}>Open post</Link>
+        <Link to={postPath(username, post.id)}>開く</Link>
         <span className="muted">{post.url}</span>
       </div>
     </article>
@@ -196,7 +217,7 @@ function FeedCard({ post, username }: { post: Post; username: string }) {
 
 function Composer({ username, onCreated }: { username: string; onCreated: (post: Post) => void }) {
   const navigate = useNavigate();
-  const [contentSource, setContentSource] = useState("Hello, world.");
+  const [contentSource, setContentSource] = useState("こんにちは。");
   const [visibility, setVisibility] = useState<Post["visibility"]>("Public");
   const [contentFormat, setContentFormat] = useState<Post["content_format"]>("Plaintext");
   const [replyTo, setReplyTo] = useState("");
@@ -220,7 +241,7 @@ function Composer({ username, onCreated }: { username: string; onCreated: (post:
       setReplyTo("");
       navigate(postPath(username, post.id));
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "failed to create post");
+      setError(cause instanceof Error ? cause.message : "投稿を作成できませんでした。");
     } finally {
       setIsSaving(false);
     }
@@ -229,58 +250,58 @@ function Composer({ username, onCreated }: { username: string; onCreated: (post:
   return (
     <section className="panel composer-panel">
       <div className="panel-header">
-        <h2>Compose</h2>
-        <span>posting as @{username}</span>
+        <h2>投稿</h2>
+        <span>@{username} で投稿</span>
       </div>
 
       <form className="composer" onSubmit={submit}>
         <label>
-          <span>Content</span>
+          <span>本文</span>
           <textarea
             value={contentSource}
             onChange={(event) => setContentSource(event.target.value)}
             rows={7}
-            placeholder="Write something compact."
+            placeholder="短く、気軽に書く。"
           />
         </label>
 
         <div className="composer-row">
           <label>
-            <span>Format</span>
+            <span>形式</span>
             <select
               value={contentFormat}
               onChange={(event) => setContentFormat(event.target.value as Post["content_format"])}
             >
-              <option value="Plaintext">Plaintext</option>
-              <option value="Markdown">Markdown</option>
+              <option value="Plaintext">プレーンテキスト</option>
+              <option value="Markdown">マークダウン</option>
             </select>
           </label>
 
           <label>
-            <span>Visibility</span>
+            <span>公開範囲</span>
             <select
               value={visibility}
               onChange={(event) => setVisibility(event.target.value as Post["visibility"])}
             >
-              <option value="Public">Public</option>
-              <option value="Unlisted">Unlisted</option>
-              <option value="Followers">Followers</option>
-              <option value="Direct">Direct</option>
+              <option value="Public">公開</option>
+              <option value="Unlisted">限定公開</option>
+              <option value="Followers">フォロワー</option>
+              <option value="Direct">ダイレクト</option>
             </select>
           </label>
         </div>
 
         <label>
-          <span>Reply to</span>
+          <span>返信先</span>
           <input
             value={replyTo}
             onChange={(event) => setReplyTo(event.target.value)}
-            placeholder="Optional post UUID"
+            placeholder="必要なら投稿 ID"
           />
         </label>
 
         <button type="submit" disabled={isSaving}>
-          {isSaving ? "Publishing..." : "Publish"}
+          {isSaving ? "送信中..." : "投稿する"}
         </button>
 
         {error ? <p className="error">{error}</p> : null}
@@ -298,10 +319,10 @@ function LoadingPanel({ title, subtitle }: { title: string; subtitle: string }) 
     <AppShell title={title} subtitle={subtitle}>
       <section className="panel wide-panel">
         <div className="panel-header">
-          <h2>Loading</h2>
-          <span>please wait</span>
+          <h2>読み込み</h2>
+          <span>少し待ってください</span>
         </div>
-        <p className="summary">Checking the current session and loading the requested view.</p>
+        <p className="summary">セッションを確認し、必要な画面を開いています。</p>
       </section>
     </AppShell>
   );
@@ -342,7 +363,7 @@ function TimelinePage({
         setNextCursor(postPage.next_cursor);
       } catch (cause) {
         if (!cancelled) {
-          setError(cause instanceof Error ? cause.message : "failed to load timeline");
+          setError(cause instanceof Error ? cause.message : "タイムラインを読み込めませんでした。");
         }
       }
     }
@@ -367,7 +388,7 @@ function TimelinePage({
       setPosts((current) => [...current, ...page.posts]);
       setNextCursor(page.next_cursor);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "failed to load more posts");
+      setError(cause instanceof Error ? cause.message : "追加の投稿を読み込めませんでした。");
     } finally {
       setIsLoadingMore(false);
     }
@@ -377,8 +398,8 @@ function TimelinePage({
     <AppShell title={title} subtitle={subtitle}>
       <section className="panel profile-panel">
         <div className="panel-header">
-          <h2>Profile</h2>
-          <span>{actor?.actor_url ?? "loading..."}</span>
+          <h2>プロフィール</h2>
+          <span>{actor?.actor_url ?? "読み込み中..."}</span>
         </div>
 
         {error ? (
@@ -387,26 +408,26 @@ function TimelinePage({
           <>
             <h1>{actor.display_name}</h1>
             <p className="handle">@{actor.username}</p>
-            <p className="summary">{actor.summary ?? "No summary yet."}</p>
+            <p className="summary">{actor.summary ?? "まだ説明文はありません。"}</p>
             <dl className="profile-grid">
               <div>
-                <dt>Actor</dt>
+                <dt>アクター</dt>
                 <dd>
                   <a href={actor.actor_url}>{actor.actor_url}</a>
                 </dd>
               </div>
               <div>
-                <dt>Inbox</dt>
-                <dd>{actor.inbox_url ?? "unset"}</dd>
+                <dt>受信箱</dt>
+                <dd>{actor.inbox_url ?? "未設定"}</dd>
               </div>
               <div>
-                <dt>Outbox</dt>
-                <dd>{actor.outbox_url ?? "unset"}</dd>
+                <dt>送信箱</dt>
+                <dd>{actor.outbox_url ?? "未設定"}</dd>
               </div>
             </dl>
           </>
         ) : (
-          <p className="muted">Loading actor...</p>
+          <p className="muted">アクターを読み込み中...</p>
         )}
       </section>
 
@@ -421,13 +442,13 @@ function TimelinePage({
 
       <section className="panel feed-panel">
         <div className="panel-header">
-          <h2>Posts</h2>
-          <span>{posts.length} items</span>
+          <h2>投稿一覧</h2>
+          <span>{posts.length} 件</span>
         </div>
 
         <div className="feed-list">
           {posts.length === 0 ? (
-            <p className="muted">No posts yet.</p>
+            <p className="muted">まだ投稿がありません。</p>
           ) : (
             posts.map((post) => <FeedCard key={post.id} post={post} username={username} />)
           )}
@@ -436,7 +457,7 @@ function TimelinePage({
         {nextCursor ? (
           <div className="feed-actions">
             <button type="button" onClick={() => void loadMore()} disabled={isLoadingMore}>
-              {isLoadingMore ? "Loading..." : "Load more"}
+              {isLoadingMore ? "読み込み中..." : "もっと読む"}
             </button>
           </div>
         ) : null}
@@ -449,7 +470,7 @@ function HomePage() {
   const { actor, status } = useSession();
 
   if (status === "loading") {
-    return <LoadingPanel title="Home timeline" subtitle="Checking the current session." />;
+    return <LoadingPanel title="ホーム" subtitle="セッションを確認しています。" />;
   }
 
   if (!actor) {
@@ -459,8 +480,8 @@ function HomePage() {
   return (
     <TimelinePage
       username={actor.username}
-      title="Home timeline"
-      subtitle={`Posts visible from @${actor.username}.`}
+      title="ホーム"
+      subtitle={`@${actor.username} に見える投稿を並べています。`}
       composerUsername={actor.username}
     />
   );
@@ -477,8 +498,8 @@ function UserPage() {
   return (
     <TimelinePage
       username={username}
-      title={`Profile for @${username}`}
-      subtitle="Profile and posts for a local actor."
+      title={`@${username} のプロフィール`}
+      subtitle="プロフィールと投稿を表示します。"
     />
   );
 }
@@ -502,7 +523,7 @@ function PostPage() {
         }
       } catch (cause) {
         if (!cancelled) {
-          setError(cause instanceof Error ? cause.message : "failed to load post");
+          setError(cause instanceof Error ? cause.message : "投稿を読み込めませんでした。");
         }
       }
     }
@@ -515,10 +536,10 @@ function PostPage() {
   }, [postId]);
 
   return (
-    <AppShell title="Single post view" subtitle={`Post detail for @${username}.`}>
+    <AppShell title="投稿" subtitle={`@${username} の投稿詳細です。`}>
       <section className="panel wide-panel">
         <div className="panel-header">
-          <h2>Post</h2>
+          <h2>投稿</h2>
           <span>{postId}</span>
         </div>
 
@@ -527,7 +548,7 @@ function PostPage() {
         ) : post ? (
           <FeedCard post={post} username={username} />
         ) : (
-          <p className="muted">Loading post...</p>
+          <p className="muted">投稿を読み込み中...</p>
         )}
       </section>
     </AppShell>
@@ -554,14 +575,14 @@ function LoginPage() {
       });
       navigate("/home");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "failed to sign in");
+      setError(cause instanceof Error ? cause.message : "ログインできませんでした。");
     } finally {
       setIsSigningIn(false);
     }
   }
 
   if (status === "loading") {
-    return <LoadingPanel title="Sign in" subtitle="Checking the current session." />;
+    return <LoadingPanel title="ログイン" subtitle="セッションを確認しています。" />;
   }
 
   if (actor) {
@@ -570,18 +591,18 @@ function LoginPage() {
 
   return (
     <AppShell
-      title="Sign in"
-      subtitle="Choose the local actor you want to post as. Passwords are managed by the CLI."
+      title="ログイン"
+      subtitle="ローカルユーザーで続行します。"
     >
       <section className="panel login-panel">
         <div className="panel-header">
-          <h2>Login</h2>
-          <span>local session</span>
+          <h2>ログイン</h2>
+          <span>ローカルセッション</span>
         </div>
 
         <form className="login-form" onSubmit={submit}>
           <label>
-            <span>Local username</span>
+            <span>ユーザー名</span>
             <input
               value={username}
               onChange={(event) => setUsername(event.target.value)}
@@ -592,7 +613,7 @@ function LoginPage() {
           </label>
 
           <label>
-            <span>Password</span>
+            <span>パスワード</span>
             <input
               value={password}
               onChange={(event) => setPassword(event.target.value)}
@@ -602,7 +623,7 @@ function LoginPage() {
           </label>
 
           <button type="submit" disabled={isSigningIn}>
-            {isSigningIn ? "Signing in..." : "Continue"}
+            {isSigningIn ? "確認中..." : "続行"}
           </button>
 
           {error ? <p className="error">{error}</p> : null}
@@ -611,23 +632,23 @@ function LoginPage() {
 
       <section className="panel login-aside">
         <div className="panel-header">
-          <h2>What this does</h2>
-          <span>local session only</span>
+          <h2>この画面でできること</h2>
+          <span>ローカルで完結</span>
         </div>
 
         <p className="summary">
-          This screen validates the username and password against the server, then stores a
-          session cookie. User creation itself happens from the CLI.
+          ユーザー名とパスワードをサーバーで確認し、セッション cookie を保存します。
+          ユーザーの作成や更新は CLI 側で行います。
         </p>
 
         <ul className="feature-list">
-          <li>Passwords are set when the user is created or updated from the CLI.</li>
-          <li>The browser only keeps the session cookie, not the password.</li>
-          <li>The home timeline composer uses the signed-in local actor.</li>
+          <li>パスワードは CLI でユーザーを作成・更新するときに設定します。</li>
+          <li>ブラウザに残るのはセッション cookie だけです。</li>
+          <li>ホームの投稿欄は、ログイン中のローカルアクターを使います。</li>
         </ul>
 
         <div className="login-note">
-          <span>Suggested account</span>
+          <span>推奨アカウント</span>
           <strong>@{defaultUsername}</strong>
         </div>
       </section>
@@ -637,24 +658,24 @@ function LoginPage() {
 
 function NotFoundPage() {
   return (
-    <AppShell title="Page not found" subtitle="The requested screen does not exist.">
+    <AppShell title="見つかりません" subtitle="指定された画面はありません。">
       <section className="panel wide-panel">
         <div className="panel-header">
           <h2>404</h2>
-          <span>route missing</span>
+          <span>見つかりません</span>
         </div>
 
-        <h1 className="hero-title">That page is not here.</h1>
+        <h1 className="hero-title">そのページはありません。</h1>
         <p className="summary">
-          Use the home timeline, open a profile, or sign in with a local actor username.
+          ホームへ戻るか、プロフィールを開いてください。
         </p>
 
         <div className="button-row">
           <Link className="secondary-button" to="/home">
-            Home
+            ホームへ
           </Link>
           <Link className="secondary-button" to="/login">
-            Sign in
+            ログイン
           </Link>
         </div>
       </section>
@@ -666,7 +687,7 @@ function RootRedirect() {
   const { actor, status } = useSession();
 
   if (status === "loading") {
-    return <LoadingPanel title="kodamapub" subtitle="Checking the current session." />;
+    return <LoadingPanel title="kodamapub" subtitle="セッションを確認しています。" />;
   }
 
   return <Navigate replace to={actor ? "/home" : "/login"} />;

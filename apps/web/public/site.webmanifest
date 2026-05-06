@@ -1,0 +1,16 @@
+{
+  "name": "kodamapub",
+  "short_name": "kodamapub",
+  "description": "kodamapub のローカル投稿 UI と ActivityPub 連合の入口になる Web frontend",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f1ea",
+  "theme_color": "#235f63",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

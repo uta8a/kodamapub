@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 180" role="img" aria-label="kodamapub">
+  <defs>
+    <linearGradient id="g" x1="18" y1="18" x2="162" y2="162" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#235f63" />
+      <stop offset="0.55" stop-color="#2f7a78" />
+      <stop offset="1" stop-color="#8f5a33" />
+    </linearGradient>
+  </defs>
+  <rect x="10" y="10" width="160" height="160" rx="44" fill="url(#g)" />
+  <circle cx="130" cy="38" r="16" fill="#ffffff" opacity="0.15" />
+  <circle cx="130" cy="38" r="7" fill="#f4f1ea" opacity="0.96" />
+  <text
+    x="50%"
+    y="56%"
+    text-anchor="middle"
+    dominant-baseline="middle"
+    fill="#ffffff"
+    font-family="Hiragino Sans, Hiragino Kaku Gothic ProN, Noto Sans JP, system-ui, sans-serif"
+    font-size="96"
+    font-weight="700"
+    letter-spacing="-0.05em"
+  >k</text>
+</svg>
