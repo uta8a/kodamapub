@@ -122,6 +122,10 @@ wait_for_mastodon_redis() {
   return 1
 }
 
+run_delivery_jobs() {
+  compose run --rm --no-deps cli-job run-deliveries --limit 100 >/dev/null
+}
+
 wait_for_follow_state() {
   local expected="$1"
   local remote_id="$2"
@@ -129,6 +133,8 @@ wait_for_follow_state() {
   local attempt
 
   for attempt in $(seq 1 40); do
+    run_delivery_jobs
+
     local relationship
     if ! relationship="$(curl_request "mastodon relationships" \
       "mastodon.e2e" "3001" \
@@ -160,6 +166,8 @@ wait_for_remote_post_content() {
   local attempt
 
   for attempt in $(seq 1 40); do
+    run_delivery_jobs
+
     local statuses
     if ! statuses="$(
       curl_request "mastodon statuses" \
@@ -361,11 +369,11 @@ main() {
 
   trap 'status=$?; if [ "$status" -ne 0 ]; then compose logs --no-color --timestamps server mastodon-web mastodon-sidekiq mastodon-db mastodon-redis >&2 || true; fi; compose down -v --remove-orphans >/dev/null 2>&1 || true; exit "$status"' EXIT
 
-  compose up -d mastodon-db mastodon-redis edge server delivery-worker >/dev/null
+  compose up -d mastodon-db mastodon-redis server web delivery-worker >/dev/null
   wait_for_mastodon_db
   wait_for_mastodon_redis
   compose run --rm --no-deps -e RAILS_ENV=production mastodon-web bundle exec rails db:prepare >/dev/null
-  compose up -d mastodon-web mastodon-sidekiq mastodon-proxy >/dev/null
+  compose up -d edge mastodon-web mastodon-sidekiq mastodon-proxy >/dev/null
 
   wait_for_http "edge" "443" "https://edge/health" "kodamapub edge"
   wait_for_mastodon_instance

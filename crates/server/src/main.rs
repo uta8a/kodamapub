@@ -25,7 +25,7 @@ use kodamapub_domain::{
     ActorProfile, ContentFormat, ContentSource, DomainError, FollowRelation, LocalActor, NewPost,
     Post, PostId, PublicBaseUrl, Username, Visibility,
 };
-use kodamapub_job::{JobError, RetryPolicy, enqueue_create_deliveries};
+use kodamapub_job::{JobError, RetryPolicy, activate_follow_and_backfill, enqueue_create_deliveries};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower::ServiceBuilder;
@@ -789,7 +789,10 @@ async fn post_inbox(
         IncomingActivity::Create(create) => {
             handle_create_activity(&state, &remote_actor, create).await?;
         }
-        IncomingActivity::Accept(_) | IncomingActivity::Undo(_) | IncomingActivity::Delete(_) => {}
+        IncomingActivity::Accept(accept) => {
+            handle_accept_activity(&state, &local_actor, &remote_actor, accept).await?;
+        }
+        IncomingActivity::Undo(_) | IncomingActivity::Delete(_) => {}
     }
 
     Ok(StatusCode::ACCEPTED)
@@ -983,7 +986,31 @@ async fn handle_follow_activity(
         &RetryPolicy::default(),
     )
     .await?;
-    tracing::info!(job_id = %job.id.0, "queued accept delivery for inbound follow");
+    tracing::info!(
+        job_id = %job.id.0,
+        follow_id = %follow.id,
+        local_actor = %local_actor.profile.actor_url,
+        remote_actor = %remote_actor.profile.actor_url,
+        "queued accept delivery for inbound follow"
+    );
+    Ok(())
+}
+
+async fn handle_accept_activity(
+    state: &AppState,
+    local_actor: &kodamapub_domain::LocalActor,
+    remote_actor: &kodamapub_domain::RemoteActor,
+    accept: kodamapub_activitypub::IncomingAcceptActivity,
+) -> Result<(), ApiError> {
+    tracing::info!(
+        local_actor = %local_actor.profile.actor_url,
+        remote_actor = %remote_actor.profile.actor_url,
+        accept_id = %accept.id,
+        object = %accept.object,
+        "received inbound accept activity"
+    );
+
+    activate_follow_and_backfill(&state.db, local_actor, remote_actor).await?;
     Ok(())
 }
 

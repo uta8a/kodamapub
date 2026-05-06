@@ -226,12 +226,26 @@ pub async fn process_due_jobs_with_client(
             .await?
             .ok_or(JobError::MissingLocalActor)?;
 
+        tracing::info!(
+            job_id = %job.id.0,
+            kind = ?job.kind,
+            target = %job.target_inbox_url,
+            attempts = job.attempts,
+            "delivering job"
+        );
+
         match deliver_signed_activity(client, &local_actor, &job.target_inbox_url, &job.payload)
             .await
         {
             Ok(()) => {
                 db.delivery_jobs().mark_delivered(job.id).await?;
                 maybe_activate_follow_delivery(db, &job, &local_actor).await?;
+                maybe_activate_accept_delivery(db, &job, &local_actor).await?;
+                tracing::info!(
+                    job_id = %job.id.0,
+                    kind = ?job.kind,
+                    "delivered job"
+                );
                 summary.delivered += 1;
             }
             Err(error) => {
@@ -240,13 +254,27 @@ pub async fn process_due_jobs_with_client(
                     db.delivery_jobs()
                         .mark_failed(job.id, attempts, error.to_string())
                         .await?;
+                    tracing::warn!(
+                        job_id = %job.id.0,
+                        kind = ?job.kind,
+                        error = %error,
+                        "failed job"
+                    );
                     summary.failed += 1;
                 } else {
                     let backoff = ChronoDuration::from_std(retry_policy.backoff)
                         .unwrap_or_else(|_| ChronoDuration::seconds(30));
+                    let retry_at = Utc::now() + backoff;
                     db.delivery_jobs()
-                        .reschedule(job.id, attempts, Utc::now() + backoff, error.to_string())
+                        .reschedule(job.id, attempts, retry_at, error.to_string())
                         .await?;
+                    tracing::warn!(
+                        job_id = %job.id.0,
+                        kind = ?job.kind,
+                        error = %error,
+                        retry_at = %retry_at,
+                        "rescheduled job"
+                    );
                     summary.rescheduled += 1;
                 }
             }
@@ -299,7 +327,28 @@ async fn maybe_activate_follow_delivery(
     Ok(())
 }
 
-async fn activate_follow_and_backfill(
+async fn maybe_activate_accept_delivery(
+    db: &Database,
+    job: &DeliveryJob,
+    local_actor: &LocalActor,
+) -> Result<(), JobError> {
+    if job.kind != DeliveryKind::Accept {
+        return Ok(());
+    }
+
+    let Some(remote_actor) = db
+        .remote_actors()
+        .find_by_inbox_url(&job.target_inbox_url)
+        .await?
+    else {
+        return Ok(());
+    };
+
+    activate_follow_and_backfill(db, local_actor, &remote_actor).await?;
+    Ok(())
+}
+
+pub async fn activate_follow_and_backfill(
     db: &Database,
     local_actor: &LocalActor,
     remote_actor: &RemoteActor,
@@ -317,9 +366,21 @@ async fn activate_follow_and_backfill(
     db.follows()
         .set_state(local_actor.id(), remote_actor.id(), FollowState::Active)
         .await?;
+    tracing::info!(
+        local_actor = %local_actor.profile.actor_url,
+        remote_actor = %remote_actor.profile.actor_url,
+        "activated follow after delivery"
+    );
 
-    enqueue_existing_create_deliveries(db, local_actor, remote_actor, &RetryPolicy::default())
-        .await?;
+    let backfilled =
+        enqueue_existing_create_deliveries(db, local_actor, remote_actor, &RetryPolicy::default())
+            .await?;
+    tracing::info!(
+        local_actor = %local_actor.profile.actor_url,
+        remote_actor = %remote_actor.profile.actor_url,
+        backfilled,
+        "backfilled existing posts after delivery"
+    );
     Ok(())
 }
 

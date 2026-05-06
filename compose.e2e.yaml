@@ -91,7 +91,7 @@ services:
       mastodon-web:
         condition: service_healthy
     ports:
-      - "3001:443"
+      - "3001:3001"
     networks:
       default:
         aliases:
