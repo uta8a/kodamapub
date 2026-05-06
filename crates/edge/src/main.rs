@@ -170,8 +170,9 @@ fn main() -> anyhow::Result<()> {
     let mut service = http_proxy_service(&server.configuration, proxy);
     service.add_tls(
         "0.0.0.0:443",
-        "/certs/app.localhost.pem",
-        "/certs/app.localhost-key.pem",
+        &env::var("EDGE_TLS_CERT_PATH").unwrap_or_else(|_| "/certs/app.localhost.pem".to_string()),
+        &env::var("EDGE_TLS_KEY_PATH")
+            .unwrap_or_else(|_| "/certs/app.localhost-key.pem".to_string()),
     )?;
     server.add_service(service);
 
