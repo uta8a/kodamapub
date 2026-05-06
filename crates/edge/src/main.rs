@@ -162,17 +162,19 @@ fn main() -> anyhow::Result<()> {
         .format_timestamp_secs()
         .init();
 
-    let listen_addr = env::var("EDGE_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
-
     let proxy = KodamapubEdge::from_env();
 
     let mut server = Server::new(None)?;
     server.bootstrap();
 
     let mut service = http_proxy_service(&server.configuration, proxy);
-    service.add_tcp(&listen_addr);
+    service.add_tls(
+        "0.0.0.0:443",
+        "/certs/app.localhost.pem",
+        "/certs/app.localhost-key.pem",
+    )?;
     server.add_service(service);
 
-    info!("kodamapub-edge started listen_addr={}", listen_addr);
+    info!("kodamapub-edge started listen_addr=0.0.0.0:443");
     server.run_forever();
 }

@@ -1,12 +1,12 @@
 [package]
-name = "kodamapub-cli"
-version = "0.1.0"
+authors.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
+name = "kodamapub-cli"
 publish.workspace = true
 repository.workspace = true
-authors.workspace = true
+rust-version.workspace = true
+version = "0.1.0"
 
 [[bin]]
 name = "kodamapub"
@@ -21,10 +21,10 @@ kodamapub-job.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 tracing-subscriber.workspace = true
-reqwest.workspace = true
+tracing.workspace = true
 url.workspace = true

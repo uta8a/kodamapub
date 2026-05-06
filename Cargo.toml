@@ -28,8 +28,8 @@ kodamapub-job = {path = "crates/job"}
 kodamapub-media = {path = "crates/media"}
 
 # async / web
-axum = {version = "0.8", features = ["macros", "json"]}
 async-trait = "0.1"
+axum = {version = "0.8", features = ["macros", "json"]}
 http = "1"
 hyper = "1"
 tokio = {version = "1", features = ["full"]}
@@ -75,7 +75,7 @@ reqwest = {version = "0.13", features = ["json", "rustls"], default-features = f
 clap = {version = "4", features = ["derive", "env"]}
 
 # proxy
-pingora = {version = "0.8", features = ["proxy"]}
+pingora = {version = "0.8", features = ["proxy", "openssl"]}
 
 # tests
 pretty_assertions = "1"

@@ -1,6 +1,6 @@
 [tasks.compose-up]
 description = "Start the local docker compose stack"
-run = "docker compose up --build"
+run = "env PUBLIC_BASE_URL=https://app.localhost docker compose up --build"
 
 [tasks.compose-down]
 description = "Stop the local docker compose stack"
