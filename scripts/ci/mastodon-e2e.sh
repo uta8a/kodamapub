@@ -87,6 +87,36 @@ wait_for_mastodon_instance() {
   return 1
 }
 
+wait_for_mastodon_db() {
+  local attempt
+
+  for attempt in $(seq 1 60); do
+    if compose exec -T mastodon-db pg_isready -U mastodon -d mastodon >/dev/null 2>&1; then
+      return 0
+    fi
+
+    sleep 2
+  done
+
+  printf 'timed out waiting for mastodon db\n' >&2
+  return 1
+}
+
+wait_for_mastodon_redis() {
+  local attempt
+
+  for attempt in $(seq 1 60); do
+    if compose exec -T mastodon-redis redis-cli ping >/dev/null 2>&1; then
+      return 0
+    fi
+
+    sleep 2
+  done
+
+  printf 'timed out waiting for mastodon redis\n' >&2
+  return 1
+}
+
 wait_for_follow_state() {
   local expected="$1"
   local remote_id="$2"
@@ -339,7 +369,9 @@ main() {
   trap 'status=$?; if [ "$status" -ne 0 ]; then compose logs --no-color --timestamps server mastodon-web mastodon-sidekiq mastodon-db mastodon-redis >&2 || true; fi; compose down -v --remove-orphans >/dev/null 2>&1 || true; exit "$status"' EXIT
 
   compose up -d mastodon-db mastodon-redis edge server delivery-worker >/dev/null
-  compose run --rm --no-deps mastodon-web bundle exec rails db:migrate >/dev/null
+  wait_for_mastodon_db
+  wait_for_mastodon_redis
+  compose run --rm --no-deps -e RAILS_ENV=production mastodon-web bundle exec rails db:prepare >/dev/null
   compose up -d mastodon-web mastodon-sidekiq mastodon-proxy >/dev/null
 
   wait_for_http https://127.0.0.1/health "kodamapub edge"

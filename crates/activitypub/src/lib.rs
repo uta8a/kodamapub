@@ -690,6 +690,12 @@ pub fn verify_incoming_activity_signature(
         None => host.to_string(),
     });
     let signature_host = signature_host_header(headers)?;
+    let mut candidate_hosts = host_candidates(&signature_host);
+    if let Some(key_id_host) = key_id_host {
+        candidate_hosts.extend(host_candidates(&key_id_host));
+    }
+    candidate_hosts.sort();
+    candidate_hosts.dedup();
 
     eprintln!(
         "incoming signature raw key_id={} headers={} signature_header={} digest_header={} method={} request_target={} host={} date={}",
@@ -732,13 +738,6 @@ pub fn verify_incoming_activity_signature(
     .map_err(|error: rsa::signature::Error| {
         ActivityPubError::InvalidSignatureHeader(error.to_string())
     })?;
-    let mut candidate_hosts = vec![signature_host.clone()];
-    if let Some(key_id_host) = key_id_host {
-        if key_id_host != signature_host {
-            candidate_hosts.push(key_id_host);
-        }
-    }
-
     for candidate_host in candidate_hosts {
         let signing_string = canonical_signature_string(
             headers,
@@ -876,6 +875,22 @@ fn signature_host_header(headers: &HeaderMap) -> Result<String, ActivityPubError
     Err(ActivityPubError::InvalidSignatureHeader(
         "missing host".to_string(),
     ))
+}
+
+fn host_candidates(host: &str) -> Vec<String> {
+    let mut candidates = vec![host.to_string()];
+
+    if let Ok(parsed) = Url::parse(&format!("https://{host}")) {
+        if let Some(host_str) = parsed.host_str() {
+            candidates.push(host_str.to_string());
+            if parsed.port().is_none() {
+                candidates.push(format!("{host_str}:443"));
+                candidates.push(format!("{host_str}:80"));
+            }
+        }
+    }
+
+    candidates
 }
 
 fn parse_url_field(value: &serde_json::Value, field: &str) -> Result<Url, ActivityPubError> {
