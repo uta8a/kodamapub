@@ -18,9 +18,9 @@ COPY apps ./apps
 ENV CARGO_HOME=/usr/local/cargo
 ENV RUST_BACKTRACE=1
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-  --mount=type=cache,target=/usr/local/cargo/git \
-  --mount=type=cache,target=/workspace/target \
+RUN --mount=type=cache,id=kodamapub-cargo-registry,sharing=locked,target=/usr/local/cargo/registry \
+  --mount=type=cache,id=kodamapub-cargo-git,sharing=locked,target=/usr/local/cargo/git \
+  --mount=type=cache,id=kodamapub-edge-target,sharing=locked,target=/workspace/target \
   cargo build --locked --release -p kodamapub-edge
 
 FROM debian:bookworm-slim AS runtime
