@@ -209,19 +209,15 @@ create_mastodon_user() {
   printf '%s\n' "${password}"
 }
 
-request_user_token() {
+create_mastodon_user_token() {
   local client_id="$1"
-  local client_secret="$2"
-  local password="$3"
 
-  curl -fsS -X POST \
-    --data-urlencode "grant_type=password" \
-    --data-urlencode "client_id=${client_id}" \
-    --data-urlencode "client_secret=${client_secret}" \
-    --data-urlencode "username=e2e" \
-    --data-urlencode "password=${password}" \
-    --data-urlencode "scope=read write" \
-    http://127.0.0.1:3001/oauth/token
+  compose exec -T \
+    -e CLIENT_ID="${client_id}" \
+    -e USER_EMAIL="e2e@example.com" \
+    mastodon-web \
+    bash -lc \
+    'RAILS_ENV=production bundle exec rails runner '\''app = Doorkeeper::Application.find_by!(uid: ENV.fetch("CLIENT_ID")); user = User.find_by!(email: ENV.fetch("USER_EMAIL")); token = Doorkeeper::AccessToken.create_for(application: app, resource_owner: user, scopes: "read write"); puts token.token'\'''
 }
 
 lookup_remote_account_id() {
@@ -270,7 +266,7 @@ assert_no_server_errors() {
 }
 
 main() {
-  local app_json client_id client_secret password user_token remote_account_id
+  local app_json client_id user_token remote_account_id
   local local_cookie_jar post_content csrf_token
 
   : "${PUBLIC_BASE_URL:=http://edge}"
@@ -294,10 +290,9 @@ main() {
 
   app_json="$(create_mastodon_app)"
   client_id="$(jq -r '.client_id' <<<"${app_json}")"
-  client_secret="$(jq -r '.client_secret' <<<"${app_json}")"
 
-  password="$(create_mastodon_user)"
-  user_token="$(request_user_token "${client_id}" "${client_secret}" "${password}" | jq -r '.access_token')"
+  create_mastodon_user
+  user_token="$(create_mastodon_user_token "${client_id}")"
 
   if [[ -z "${user_token}" || "${user_token}" == "null" ]]; then
     printf 'failed to obtain Mastodon user token\n' >&2
