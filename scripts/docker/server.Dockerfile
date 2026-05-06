@@ -20,7 +20,8 @@ ENV RUST_BACKTRACE=1
 RUN --mount=type=cache,id=kodamapub-cargo-registry,sharing=locked,target=/usr/local/cargo/registry \
   --mount=type=cache,id=kodamapub-cargo-git,sharing=locked,target=/usr/local/cargo/git \
   --mount=type=cache,id=kodamapub-server-target,sharing=locked,target=/workspace/target \
-  cargo build --locked --release -p kodamapub-server
+  cargo build --locked --release -p kodamapub-server \
+  && cp /workspace/target/release/kodamapub-server /tmp/kodamapub-server
 
 FROM debian:bookworm-slim AS runtime
 
@@ -32,7 +33,7 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY --from=builder /workspace/target/release/kodamapub-server /usr/local/bin/kodamapub-server
+COPY --from=builder /tmp/kodamapub-server /usr/local/bin/kodamapub-server
 
 ENV BIND_ADDR=0.0.0.0:3000
 
