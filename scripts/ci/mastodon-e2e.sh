@@ -11,7 +11,7 @@ wait_for_http() {
   local attempt
 
   for attempt in $(seq 1 60); do
-    if curl -fsS "$url" >/dev/null; then
+    if curl -kfsS "$url" >/dev/null; then
       printf 'ready: %s\n' "$label"
       return 0
     fi
@@ -194,8 +194,8 @@ main() {
   compose run --rm --no-deps mastodon-web bundle exec rails db:migrate >/dev/null
   compose up -d --build mastodon-web mastodon-sidekiq >/dev/null
 
-  wait_for_http http://127.0.0.1/api/health "kodamapub server via edge"
-  wait_for_http http://127.0.0.1/api/v1/instance "mastodon instance"
+  wait_for_http https://127.0.0.1/api/health "kodamapub server via edge"
+  wait_for_http http://127.0.0.1:3001/api/v1/instance "mastodon instance"
 
   create_local_actor
 
