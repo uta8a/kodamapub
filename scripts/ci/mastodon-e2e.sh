@@ -56,10 +56,13 @@ wait_for_follow_state() {
 generate_mastodon_secrets() {
   local image="${MASTODON_IMAGE_TAG:-v4.5.9}"
   local mastodon_image="ghcr.io/mastodon/mastodon:${image}"
-  local secret_key_base otp_secret vapid_output
+  local secret_key_base otp_secret encryption_output vapid_output
 
   secret_key_base="$(docker run --rm "${mastodon_image}" bin/rails secret)"
   otp_secret="$(docker run --rm "${mastodon_image}" bin/rails secret)"
+  encryption_output="$(
+    docker run --rm "${mastodon_image}" bundle exec rails db:encryption:init
+  )"
   vapid_output="$(
     docker run --rm \
       -e SECRET_KEY_BASE="${secret_key_base}" \
@@ -71,6 +74,9 @@ generate_mastodon_secrets() {
   export MASTODON_IMAGE_TAG="${image}"
   export MASTODON_SECRET_KEY_BASE="${secret_key_base}"
   export MASTODON_OTP_SECRET="${otp_secret}"
+  export MASTODON_ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY="$(sed -n 's/^ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY=//p' <<<"${encryption_output}")"
+  export MASTODON_ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY="$(sed -n 's/^ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY=//p' <<<"${encryption_output}")"
+  export MASTODON_ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT="$(sed -n 's/^ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT=//p' <<<"${encryption_output}")"
   export MASTODON_VAPID_PRIVATE_KEY="$(sed -n 's/^VAPID_PRIVATE_KEY=//p' <<<"${vapid_output}")"
   export MASTODON_VAPID_PUBLIC_KEY="$(sed -n 's/^VAPID_PUBLIC_KEY=//p' <<<"${vapid_output}")"
 }
