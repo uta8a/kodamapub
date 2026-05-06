@@ -22,6 +22,10 @@ services:
       - ./tmp/certs:/certs:ro
     expose:
       - "8080"
+    networks:
+      default:
+        aliases:
+          - edge
 
   server:
     image: kodamapub-server
@@ -34,8 +38,6 @@ services:
       DATABASE_URL: sqlite:///data/kodamapub.db?mode=rwc
       PUBLIC_BASE_URL: https://edge
       KODAMAPUB_REMOTE_CA_CERT_PATH: /certs/kodamapub-e2e-ca.pem
-    extra_hosts:
-      - "mastodon.e2e:host-gateway"
     expose:
       - "3000"
     volumes:
@@ -53,8 +55,6 @@ services:
       PORT: "5173"
     depends_on:
       - server
-    extra_hosts:
-      - "mastodon.e2e:host-gateway"
     expose:
       - "5173"
 
@@ -67,8 +67,6 @@ services:
     environment:
       DATABASE_URL: sqlite:///data/kodamapub.db?mode=rwc
       KODAMAPUB_REMOTE_CA_CERT_PATH: /certs/kodamapub-e2e-ca.pem
-    extra_hosts:
-      - "mastodon.e2e:host-gateway"
     volumes:
       - server-data:/data
       - ./tmp/certs:/certs:ro
@@ -83,8 +81,6 @@ services:
     environment:
       DATABASE_URL: sqlite:///data/kodamapub.db?mode=rwc
       KODAMAPUB_REMOTE_CA_CERT_PATH: /certs/kodamapub-e2e-ca.pem
-    extra_hosts:
-      - "mastodon.e2e:host-gateway"
     volumes:
       - server-data:/data
       - ./tmp/certs:/certs:ro
@@ -96,6 +92,10 @@ services:
         condition: service_healthy
     ports:
       - "3001:443"
+    networks:
+      default:
+        aliases:
+          - mastodon.e2e
     volumes:
       - ./tmp/certs:/certs:ro
       - ./scripts/docker/mastodon-proxy.conf:/etc/nginx/conf.d/default.conf:ro
@@ -132,8 +132,6 @@ services:
         condition: service_healthy
       mastodon-redis:
         condition: service_healthy
-    extra_hosts:
-      - "edge:host-gateway"
     volumes:
       - ./tmp/certs:/certs:ro
     environment:
@@ -181,8 +179,6 @@ services:
         condition: service_healthy
       mastodon-redis:
         condition: service_healthy
-    extra_hosts:
-      - "edge:host-gateway"
     environment:
       RAILS_ENV: production
       NODE_ENV: production

@@ -5,12 +5,18 @@ compose() {
   docker compose -f compose.e2e.yaml "$@"
 }
 
+readonly E2E_CA_CERT="tmp/certs/kodamapub-e2e-ca.pem"
+
 curl_request() {
   local label="$1"
-  shift
+  local resolve_host="$2"
+  local resolve_port="$3"
+  shift 3
 
   printf 'curl[%s]: %s\n' "$label" "$*" >&2
-  curl -fsS --retry 5 --retry-all-errors --retry-connrefused --retry-delay 1 "$@"
+  curl --cacert "${E2E_CA_CERT}" \
+    --resolve "${resolve_host}:${resolve_port}:127.0.0.1" \
+    -fsS --retry 5 --retry-all-errors --retry-connrefused --retry-delay 1 "$@"
 }
 
 ensure_edge_certs() {
@@ -50,12 +56,14 @@ ensure_edge_certs() {
 }
 
 wait_for_http() {
-  local url="$1"
-  local label="$2"
+  local host="$1"
+  local port="$2"
+  local url="$3"
+  local label="$4"
   local attempt
 
   for attempt in $(seq 1 60); do
-    if curl_request "$label" -kfsS "$url" >/dev/null; then
+    if curl_request "$label" "$host" "$port" -fsS "$url" >/dev/null; then
       printf 'ready: %s\n' "$label"
       return 0
     fi
@@ -71,11 +79,8 @@ wait_for_mastodon_instance() {
   local attempt
 
   for attempt in $(seq 1 60); do
-    if curl_request "mastodon instance" -fsS \
-      -k \
-      -H 'Host: mastodon.e2e:3001' \
-      -H 'X-Forwarded-Proto: https' \
-      https://127.0.0.1:3001/api/v1/instance >/dev/null; then
+    if curl_request "mastodon instance" "mastodon.e2e" "3001" -fsS \
+      https://mastodon.e2e:3001/api/v1/instance >/dev/null; then
       printf 'ready: %s\n' "mastodon instance"
       return 0
     fi
@@ -126,13 +131,11 @@ wait_for_follow_state() {
   for attempt in $(seq 1 40); do
     local relationship
     if ! relationship="$(curl_request "mastodon relationships" \
-      -k \
-      -H 'Host: mastodon.e2e:3001' \
-      -H 'X-Forwarded-Proto: https' \
+      "mastodon.e2e" "3001" \
       -H "Authorization: Bearer ${token}" \
       --get \
       --data-urlencode "id[]=${remote_id}" \
-      https://127.0.0.1:3001/api/v1/accounts/relationships)"; then
+      https://mastodon.e2e:3001/api/v1/accounts/relationships)"; then
       sleep 3
       continue
     fi
@@ -160,13 +163,11 @@ wait_for_remote_post_content() {
     local statuses
     if ! statuses="$(
       curl_request "mastodon statuses" \
-        -k \
-        -H 'Host: mastodon.e2e:3001' \
-        -H 'X-Forwarded-Proto: https' \
+        "mastodon.e2e" "3001" \
         -H "Authorization: Bearer ${token}" \
         --get \
         --data-urlencode "limit=20" \
-        "https://127.0.0.1:3001/api/v1/accounts/${remote_id}/statuses"
+        "https://mastodon.e2e:3001/api/v1/accounts/${remote_id}/statuses"
     )"; then
       sleep 3
       continue
@@ -231,16 +232,15 @@ login_local_actor() {
   local login_output
 
   login_output="$(
-    curl_request "login local actor" -kfsS \
+    curl_request "login local actor" "edge" "443" \
       -c "${cookie_jar}" \
       -H 'Origin: https://edge' \
-      -H 'Host: edge' \
       -H 'Content-Type: application/json' \
       -d '{
         "username": "'"${username}"'",
         "password": "password"
       }' \
-      https://127.0.0.1/api/login
+      https://edge/api/login
   )"
 
   jq -r '.csrf_token' <<<"${login_output}"
@@ -252,10 +252,9 @@ create_local_post() {
   local content_source="$3"
   local username="$4"
 
-  curl_request "create local post" -kfsS -X POST \
+  curl_request "create local post" "edge" "443" -fsS -X POST \
     -b "${cookie_jar}" \
     -H 'Origin: https://edge' \
-    -H 'Host: edge' \
     -H "x-csrf-token: ${csrf_token}" \
     -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg content_source "${content_source}" '{
@@ -264,7 +263,7 @@ create_local_post() {
       visibility: "Public",
       in_reply_to: null
     }')" \
-    "https://127.0.0.1/api/users/${username}/posts" >/dev/null
+    "https://edge/api/users/${username}/posts" >/dev/null
 }
 
 create_mastodon_app() {
@@ -326,24 +325,18 @@ follow_remote_account() {
   local token="$1"
   local remote_id="$2"
 
-  curl_request "mastodon follow" -X POST \
-    -k \
-    -H 'Host: mastodon.e2e:3001' \
-    -H 'X-Forwarded-Proto: https' \
+  curl_request "mastodon follow" "mastodon.e2e" "3001" -X POST \
     -H "Authorization: Bearer ${token}" \
-    https://127.0.0.1:3001/api/v1/accounts/"${remote_id}"/follow >/dev/null
+    https://mastodon.e2e:3001/api/v1/accounts/"${remote_id}"/follow >/dev/null
 }
 
 unfollow_remote_account() {
   local token="$1"
   local remote_id="$2"
 
-  curl_request "mastodon unfollow" -X POST \
-    -k \
-    -H 'Host: mastodon.e2e:3001' \
-    -H 'X-Forwarded-Proto: https' \
+  curl_request "mastodon unfollow" "mastodon.e2e" "3001" -X POST \
     -H "Authorization: Bearer ${token}" \
-    https://127.0.0.1:3001/api/v1/accounts/"${remote_id}"/unfollow >/dev/null
+    https://mastodon.e2e:3001/api/v1/accounts/"${remote_id}"/unfollow >/dev/null
 }
 
 assert_no_server_errors() {
@@ -374,7 +367,7 @@ main() {
   compose run --rm --no-deps -e RAILS_ENV=production mastodon-web bundle exec rails db:prepare >/dev/null
   compose up -d mastodon-web mastodon-sidekiq mastodon-proxy >/dev/null
 
-  wait_for_http https://127.0.0.1/health "kodamapub edge"
+  wait_for_http "edge" "443" "https://edge/health" "kodamapub edge"
   wait_for_mastodon_instance
 
   create_local_actor "${local_username}"
