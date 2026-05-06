@@ -178,6 +178,8 @@ assert_no_server_errors() {
 main() {
   local app_json client_id client_secret password user_token remote_account_id
 
+  : "${PUBLIC_BASE_URL:=http://edge}"
+  export PUBLIC_BASE_URL
   generate_mastodon_secrets
 
   trap 'status=$?; if [ "$status" -ne 0 ]; then compose logs --no-color --timestamps server mastodon-web mastodon-sidekiq mastodon-db mastodon-redis >&2 || true; fi; compose down -v --remove-orphans >/dev/null 2>&1 || true; exit "$status"' EXIT
