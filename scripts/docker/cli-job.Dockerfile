@@ -3,8 +3,8 @@ FROM rust:1.95-bookworm AS builder
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     ca-certificates \
+    libsqlite3-dev \
     pkg-config \
-    libssl-dev \
     cmake \
   && rm -rf /var/lib/apt/lists/*
 
@@ -18,22 +18,19 @@ COPY scripts ./scripts
 ENV CARGO_HOME=/usr/local/cargo
 ENV RUST_BACKTRACE=1
 
-RUN cargo build --locked --release -p kodamapub-edge
+RUN cargo build --locked --release -p kodamapub-cli
 
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     ca-certificates \
-    libssl-dev \
+    libsqlite3-0 \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY --from=builder /workspace/target/release/kodamapub-edge /usr/local/bin/kodamapub-edge
+COPY --from=builder /workspace/target/release/kodamapub /usr/local/bin/kodamapub-cli
 
-ENV EDGE_LISTEN_ADDR=0.0.0.0:8080
-
-EXPOSE 8080
-
-CMD ["/usr/local/bin/kodamapub-edge"]
+ENTRYPOINT ["/usr/local/bin/kodamapub-cli"]
+CMD []

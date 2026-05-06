@@ -1,4 +1,4 @@
-FROM rust:1.95-bookworm
+FROM rust:1.95-bookworm AS builder
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -9,7 +9,30 @@ RUN apt-get update \
 
 WORKDIR /workspace
 
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY apps ./apps
+COPY scripts ./scripts
+
 ENV CARGO_HOME=/usr/local/cargo
 ENV RUST_BACKTRACE=1
 
-CMD ["cargo", "run", "-p", "kodamapub-server"]
+RUN cargo build --locked --release -p kodamapub-server
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libsqlite3-0 \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /workspace/target/release/kodamapub-server /usr/local/bin/kodamapub-server
+
+ENV BIND_ADDR=0.0.0.0:3000
+
+EXPOSE 3000
+
+CMD ["/usr/local/bin/kodamapub-server"]

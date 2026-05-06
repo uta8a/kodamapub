@@ -3,9 +3,9 @@ services:
     build:
       context: .
       dockerfile: scripts/docker/edge.Dockerfile
-    command: ["cargo", "run", "-p", "kodamapub-edge"]
+    restart: unless-stopped
     environment:
-      EDGE_LISTEN_ADDR: 0.0.0.0:8080
+      EDGE_LISTEN_ADDR: 0.0.0.0:443
       RUST_LOG: info
       UPSTREAM_WEB_ADDR: web:5173
       UPSTREAM_WEB_HOST: web
@@ -15,37 +15,32 @@ services:
       - server
       - web
     ports:
-      - "8080:8080"
+      - "443:443"
+      - "80:80"
     volumes:
-      - ./:/workspace
-      - cargo-registry:/usr/local/cargo/registry
-      - cargo-git:/usr/local/cargo/git
-      - cargo-target:/workspace/target
-    working_dir: /workspace
+      - ./tmp/certs:/certs:ro
+    expose:
+      - "8080"
 
   server:
     build:
       context: .
       dockerfile: scripts/docker/server.Dockerfile
-    command: ["cargo", "run", "-p", "kodamapub-server"]
+    restart: unless-stopped
     environment:
       BIND_ADDR: 0.0.0.0:3000
       DATABASE_URL: sqlite:///data/kodamapub.db?mode=rwc
-      PUBLIC_BASE_URL: http://localhost:8080
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?set PUBLIC_BASE_URL to the public https origin}
     expose:
       - "3000"
     volumes:
-      - ./:/workspace
-      - cargo-registry:/usr/local/cargo/registry
-      - cargo-git:/usr/local/cargo/git
-      - cargo-target:/workspace/target
       - server-data:/data
-    working_dir: /workspace
 
   web:
     build:
       context: .
       dockerfile: scripts/docker/web.Dockerfile
+    restart: unless-stopped
     environment:
       API_ORIGIN: http://server:3000
       PORT: "5173"
@@ -54,8 +49,15 @@ services:
     expose:
       - "5173"
 
+  cli-job:
+    build:
+      context: .
+      dockerfile: scripts/docker/cli-job.Dockerfile
+    restart: "no"
+    environment:
+      DATABASE_URL: sqlite:///data/kodamapub.db?mode=rwc
+    volumes:
+      - server-data:/data
+
 volumes:
-  cargo-git:
-  cargo-registry:
-  cargo-target:
   server-data:
