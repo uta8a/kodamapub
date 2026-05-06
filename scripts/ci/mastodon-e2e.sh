@@ -284,7 +284,7 @@ main() {
   compose run --rm --no-deps mastodon-web bundle exec rails db:migrate >/dev/null
   compose up -d mastodon-web mastodon-sidekiq >/dev/null
 
-  wait_for_http https://127.0.0.1/api/health "kodamapub server via edge"
+  wait_for_http https://127.0.0.1/health "kodamapub edge"
   wait_for_http http://127.0.0.1:3001/api/v1/instance "mastodon instance"
 
   create_local_actor
