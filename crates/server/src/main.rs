@@ -724,10 +724,14 @@ async fn post_inbox(
     let remote_actor = fetch_remote_actor(state.remote_client(), &key_actor_url).await?;
     state.db.remote_actors().upsert(&remote_actor).await?;
 
-    let signature_target = uri
-        .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or_else(|| uri.path());
+    let signature_target = headers
+        .get("x-original-uri")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_else(|| {
+            uri.path_and_query()
+                .map(|value| value.as_str())
+                .unwrap_or_else(|| uri.path())
+        });
     verify_incoming_activity_signature(
         &headers,
         method.as_str(),

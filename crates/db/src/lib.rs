@@ -248,11 +248,10 @@ impl<'a> RemoteActorRepository<'a> {
             insert into actors (
                 id, username, display_name, summary, actor_url, inbox_url, outbox_url, created_at
             ) values ($1, $2, $3, $4, $5, $6, $7, current_timestamp)
-            on conflict (id) do update set
+            on conflict (actor_url) do update set
                 username = excluded.username,
                 display_name = excluded.display_name,
                 summary = excluded.summary,
-                actor_url = excluded.actor_url,
                 inbox_url = excluded.inbox_url,
                 outbox_url = excluded.outbox_url
             "#,
@@ -1485,6 +1484,56 @@ mod tests {
             .expect("list active follows");
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].profile.actor_url, remote_actor.profile.actor_url);
+    }
+
+    #[tokio::test]
+    async fn remote_actor_upsert_reuses_existing_actor_url() {
+        let db = memory_db().await;
+
+        let remote_actor = RemoteActor {
+            profile: ActorProfile::new(
+                "bob".parse().expect("username"),
+                "Bob".parse().expect("display name"),
+                Some("remote actor".parse().expect("summary")),
+                Url::parse("https://remote.example/users/bob").expect("actor url"),
+                Some(Url::parse("https://remote.example/users/bob/inbox").expect("inbox url")),
+                Some(Url::parse("https://remote.example/users/bob/outbox").expect("outbox url")),
+            ),
+            public_key_pem: Some("REMOTE PUBLIC KEY".to_string()),
+            fetched_at: Utc::now(),
+        };
+        let updated_remote_actor = RemoteActor {
+            profile: ActorProfile::new(
+                "bob".parse().expect("username"),
+                "Bob Updated".parse().expect("display name"),
+                Some("remote actor updated".parse().expect("summary")),
+                Url::parse("https://remote.example/users/bob").expect("actor url"),
+                Some(Url::parse("https://remote.example/users/bob/inbox").expect("inbox url")),
+                Some(Url::parse("https://remote.example/users/bob/outbox").expect("outbox url")),
+            ),
+            public_key_pem: Some("REMOTE PUBLIC KEY 2".to_string()),
+            fetched_at: Utc::now(),
+        };
+
+        db.remote_actors()
+            .upsert(&remote_actor)
+            .await
+            .expect("upsert remote actor");
+        db.remote_actors()
+            .upsert(&updated_remote_actor)
+            .await
+            .expect("upsert remote actor again");
+
+        let found = db
+            .remote_actors()
+            .find_by_actor_url(&Url::parse("https://remote.example/users/bob").expect("actor url"))
+            .await
+            .expect("find remote actor")
+            .expect("remote actor exists");
+
+        assert_eq!(found.profile.actor_url, remote_actor.profile.actor_url);
+        assert_eq!(found.profile.display_name, updated_remote_actor.profile.display_name);
+        assert_eq!(found.public_key_pem, updated_remote_actor.public_key_pem);
     }
 
     #[tokio::test]

@@ -217,6 +217,12 @@ pub enum IncomingActivity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncomingActivityObject {
+    Url(Url),
+    ObjectId(Url),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncomingFollowActivity {
     pub id: Url,
     pub actor: Url,
@@ -241,7 +247,7 @@ pub struct IncomingAcceptActivity {
 pub struct IncomingUndoActivity {
     pub id: Url,
     pub actor: Url,
-    pub object: Url,
+    pub object: IncomingActivityObject,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -587,7 +593,7 @@ pub fn parse_incoming_activity(body: &str) -> Result<IncomingActivity, ActivityP
         "Follow" => Ok(IncomingActivity::Follow(IncomingFollowActivity {
             id,
             actor,
-            object: parse_url_field(&value, "object")?,
+            object: parse_activity_object_url_field(&value, "object")?,
         })),
         "Create" => Ok(IncomingActivity::Create(IncomingCreateActivity {
             id,
@@ -599,17 +605,19 @@ pub fn parse_incoming_activity(body: &str) -> Result<IncomingActivity, ActivityP
         "Accept" => Ok(IncomingActivity::Accept(IncomingAcceptActivity {
             id,
             actor,
-            object: parse_url_field(&value, "object")?,
+            object: parse_activity_object_url_field(&value, "object")?,
         })),
         "Undo" => Ok(IncomingActivity::Undo(IncomingUndoActivity {
             id,
             actor,
-            object: parse_url_field(&value, "object")?,
+            object: parse_incoming_object_reference(value.get("object").ok_or_else(|| {
+                ActivityPubError::InvalidResource("activity missing object".to_string())
+            })?)?,
         })),
         "Delete" => Ok(IncomingActivity::Delete(IncomingDeleteActivity {
             id,
             actor,
-            object: parse_url_field(&value, "object")?,
+            object: parse_activity_object_url_field(&value, "object")?,
         })),
         other => Err(ActivityPubError::InvalidResource(format!(
             "unsupported activity type {other}"
@@ -783,6 +791,38 @@ fn parse_url_field(value: &serde_json::Value, field: &str) -> Result<Url, Activi
         .ok_or_else(|| ActivityPubError::InvalidResource(format!("activity missing {field}")))?;
     raw.parse::<Url>()
         .map_err(|error: url::ParseError| ActivityPubError::InvalidResource(error.to_string()))
+}
+
+fn parse_activity_object_url_field(
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<Url, ActivityPubError> {
+    let Some(raw) = value.get(field) else {
+        return Err(ActivityPubError::InvalidResource(format!(
+            "activity missing {field}"
+        )));
+    };
+
+    if let Some(url) = raw.as_str() {
+        return url
+            .parse::<Url>()
+            .map_err(|error: url::ParseError| ActivityPubError::InvalidResource(error.to_string()));
+    }
+
+    parse_url_field(raw, "id")
+}
+
+fn parse_incoming_object_reference(
+    value: &serde_json::Value,
+) -> Result<IncomingActivityObject, ActivityPubError> {
+    if let Some(url) = value.as_str() {
+        return url
+            .parse::<Url>()
+            .map(IncomingActivityObject::Url)
+            .map_err(|error: url::ParseError| ActivityPubError::InvalidResource(error.to_string()));
+    }
+
+    parse_url_field(value, "id").map(IncomingActivityObject::ObjectId)
 }
 
 fn parse_url_list(value: Option<&serde_json::Value>) -> Result<Vec<Url>, ActivityPubError> {
@@ -1143,6 +1183,36 @@ mod tests {
         assert_eq!(activity.object_type, "Follow");
         assert_eq!(activity.actor, local_actor.profile.actor_url);
         assert_eq!(activity.object, remote_actor.profile.actor_url);
+    }
+
+    #[test]
+    fn parse_undo_activity_accepts_embedded_follow_object() {
+        let body = serde_json::json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "id": "https://remote.example/activities/undo-1",
+            "type": "Undo",
+            "actor": "https://remote.example/users/bob",
+            "object": {
+                "id": "https://remote.example/activities/follow-1",
+                "type": "Follow",
+                "actor": "https://remote.example/users/bob",
+                "object": "https://example.invalid/users/alice"
+            }
+        })
+        .to_string();
+
+        let activity = parse_incoming_activity(&body).expect("parse undo activity");
+
+        match activity {
+            IncomingActivity::Undo(value) => match value.object {
+                IncomingActivityObject::ObjectId(url) => assert_eq!(
+                    url.as_str(),
+                    "https://remote.example/activities/follow-1"
+                ),
+                IncomingActivityObject::Url(_) => panic!("expected embedded activity id"),
+            },
+            other => panic!("unexpected activity: {other:?}"),
+        }
     }
 
     #[tokio::test]

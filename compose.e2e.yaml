@@ -1,0 +1,114 @@
+services:
+  server:
+    environment:
+      PUBLIC_BASE_URL: http://edge
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+  web:
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+  cli-job:
+    environment:
+      PUBLIC_BASE_URL: http://edge
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+  mastodon-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: mastodon
+      POSTGRES_USER: mastodon
+      POSTGRES_PASSWORD: mastodon
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U mastodon -d mastodon",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  mastodon-redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  mastodon-web:
+    image: ghcr.io/mastodon/mastodon:${MASTODON_IMAGE_TAG:-v4.5.9}
+    depends_on:
+      mastodon-db:
+        condition: service_healthy
+      mastodon-redis:
+        condition: service_healthy
+    ports:
+      - "3001:3000"
+    environment:
+      RAILS_ENV: production
+      NODE_ENV: production
+      LOCAL_DOMAIN: host.docker.internal
+      WEB_DOMAIN: host.docker.internal:3001
+      LOCAL_HTTPS: "false"
+      ALLOWED_PRIVATE_ADDRESSES: 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+      SECRET_KEY_BASE: ${MASTODON_SECRET_KEY_BASE}
+      OTP_SECRET: ${MASTODON_OTP_SECRET}
+      VAPID_PRIVATE_KEY: ${MASTODON_VAPID_PRIVATE_KEY}
+      VAPID_PUBLIC_KEY: ${MASTODON_VAPID_PUBLIC_KEY}
+      DB_HOST: mastodon-db
+      DB_PORT: "5432"
+      DB_NAME: mastodon
+      DB_USER: mastodon
+      DB_PASS: mastodon
+      REDIS_HOST: mastodon-redis
+      REDIS_PORT: "6379"
+      DB_POOL: "5"
+      DEFAULT_LOCALE: en
+      FORCE_DEFAULT_LOCALE: "true"
+      RAILS_SERVE_STATIC_FILES: "true"
+      DISABLE_AUTOMATIC_SWITCHING_TO_APPROVED_REGISTRATIONS: "true"
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    command: bundle exec puma -C config/puma.rb
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3000/health | grep -q OK"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  mastodon-sidekiq:
+    image: ghcr.io/mastodon/mastodon:${MASTODON_IMAGE_TAG:-v4.5.9}
+    depends_on:
+      mastodon-db:
+        condition: service_healthy
+      mastodon-redis:
+        condition: service_healthy
+    environment:
+      RAILS_ENV: production
+      NODE_ENV: production
+      LOCAL_DOMAIN: host.docker.internal
+      WEB_DOMAIN: host.docker.internal:3001
+      LOCAL_HTTPS: "false"
+      ALLOWED_PRIVATE_ADDRESSES: 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+      SECRET_KEY_BASE: ${MASTODON_SECRET_KEY_BASE}
+      OTP_SECRET: ${MASTODON_OTP_SECRET}
+      VAPID_PRIVATE_KEY: ${MASTODON_VAPID_PRIVATE_KEY}
+      VAPID_PUBLIC_KEY: ${MASTODON_VAPID_PUBLIC_KEY}
+      DB_HOST: mastodon-db
+      DB_PORT: "5432"
+      DB_NAME: mastodon
+      DB_USER: mastodon
+      DB_PASS: mastodon
+      REDIS_HOST: mastodon-redis
+      REDIS_PORT: "6379"
+      DB_POOL: "5"
+      DEFAULT_LOCALE: en
+      FORCE_DEFAULT_LOCALE: "true"
+      DISABLE_AUTOMATIC_SWITCHING_TO_APPROVED_REGISTRATIONS: "true"
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    command: bundle exec sidekiq -c 5 -q default -q push -q ingress -q mailers -q pull -q scheduler
