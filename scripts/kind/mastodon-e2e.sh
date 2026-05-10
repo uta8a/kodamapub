@@ -631,7 +631,7 @@ seed_mastodon_user() {
     )"
   fi
 
-  printf 'Mastodon user: e2e\n'
+  printf 'Mastodon user: e2e@uta8a.org\n'
   printf 'Mastodon password: %s\n' "${password}"
 }
 
