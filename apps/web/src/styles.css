@@ -354,12 +354,14 @@ svg {
 }
 
 .composer,
+.follow-form,
 .login-form {
   display: grid;
   gap: 14px;
 }
 
 .composer label,
+.follow-form label,
 .login-form label {
   display: grid;
   gap: 8px;
@@ -370,6 +372,7 @@ svg {
 .composer textarea,
 .composer input,
 .composer select,
+.follow-form input,
 .login-form input {
   width: 100%;
   border: 1px solid rgba(196, 189, 175, 0.95);
@@ -387,6 +390,7 @@ svg {
 
 .composer textarea::placeholder,
 .composer input::placeholder,
+.follow-form input::placeholder,
 .login-form input::placeholder {
   color: #91979d;
 }
@@ -394,6 +398,7 @@ svg {
 .composer textarea:focus-visible,
 .composer input:focus-visible,
 .composer select:focus-visible,
+.follow-form input:focus-visible,
 .login-form input:focus-visible {
   border-color: rgba(35, 95, 99, 0.42);
   box-shadow: 0 0 0 4px rgba(35, 95, 99, 0.1);
@@ -406,6 +411,7 @@ svg {
 }
 
 .composer button,
+.follow-form button,
 .login-form button,
 .secondary-button,
 .feed-actions button {
@@ -425,12 +431,14 @@ svg {
 }
 
 .composer button,
+.follow-form button,
 .login-form button {
   justify-self: start;
   background: linear-gradient(180deg, #ffffff, #f2f7f6);
 }
 
 .composer button:hover,
+.follow-form button:hover,
 .login-form button:hover,
 .secondary-button:hover,
 .feed-actions button:hover {
@@ -440,6 +448,7 @@ svg {
 }
 
 .composer button:disabled,
+.follow-form button:disabled,
 .login-form button:disabled,
 .feed-actions button:disabled {
   cursor: progress;
@@ -457,6 +466,10 @@ svg {
 .feed-list {
   display: grid;
   border-top: 1px solid rgba(196, 189, 175, 0.9);
+}
+
+.timeline-summary {
+  margin-bottom: 14px;
 }
 
 .post-card {

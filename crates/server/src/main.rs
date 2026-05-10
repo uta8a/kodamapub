@@ -15,17 +15,19 @@ use axum::{
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use kodamapub_activitypub::{
-    IncomingActivity, fetch_remote_actor, is_publicly_visible, local_actor_to_object,
-    ordered_collection, ordered_collection_page, parse_incoming_activity, post_to_create_activity,
-    post_to_note, signature_key_id_actor_url, verify_incoming_activity_signature,
-    webfinger_response,
+    IncomingActivity, discover_remote_actor, fetch_remote_actor, is_publicly_visible,
+    local_actor_to_object, ordered_collection, ordered_collection_page, parse_incoming_activity,
+    post_to_create_activity, post_to_note, signature_key_id_actor_url,
+    verify_incoming_activity_signature, webfinger_response,
 };
 use kodamapub_db::{Database, DbError};
 use kodamapub_domain::{
     ActorProfile, ContentFormat, ContentSource, DomainError, FollowRelation, LocalActor, NewPost,
     Post, PostId, PublicBaseUrl, Username, Visibility,
 };
-use kodamapub_job::{JobError, RetryPolicy, activate_follow_and_backfill, enqueue_create_deliveries};
+use kodamapub_job::{
+    JobError, RetryPolicy, activate_follow_and_backfill, enqueue_create_deliveries,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower::ServiceBuilder;
@@ -37,6 +39,7 @@ use uuid::Uuid;
 struct AppState {
     db: Database,
     public_base_url: PublicBaseUrl,
+    allowed_origins: Vec<String>,
     remote_client: reqwest::Client,
     rate_limiter: RateLimiter,
 }
@@ -56,6 +59,18 @@ struct CreatePostRequest {
 struct LoginRequest {
     username: Username,
     password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FollowRequest {
+    resource: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FollowResponse {
+    remote_actor: ActorProfile,
+    state: kodamapub_domain::FollowState,
+    job_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,9 +266,14 @@ fn build_app(state: Arc<AppState>, config: ServerConfig) -> Router {
         .route("/users/{username}/outbox", get(get_outbox))
         .route("/users/{username}/inbox", post(post_inbox))
         .route(
+            "/users/{username}/follows",
+            post(post_follow).delete(delete_follow),
+        )
+        .route(
             "/users/{username}/posts",
             get(list_user_posts).post(create_user_post),
         )
+        .route("/users/{username}/timeline", get(list_home_timeline))
         .with_state((state.clone(), config.clone()));
 
     let security_headers = ServiceBuilder::new()
@@ -303,6 +323,30 @@ async fn list_user_posts(
     }))
 }
 
+async fn list_home_timeline(
+    State((state, _config)): State<(Arc<AppState>, ServerConfig)>,
+    Path(path): Path<UsernamePath>,
+    headers: HeaderMap,
+    Query(query): Query<ListPostsQuery>,
+) -> Result<Json<PostPageResponse>, ApiError> {
+    let session = require_authenticated_session(&state, &headers).await?;
+    let session_actor = find_local_actor_by_id(&state, session.actor_id).await?;
+    if session_actor.profile.username != path.username {
+        return Err(ApiError::Forbidden("cannot read another user's timeline"));
+    }
+
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
+    let page = state
+        .db
+        .posts()
+        .list_home_timeline(session_actor.id(), query.before, limit)
+        .await?;
+    Ok(Json(PostPageResponse {
+        posts: page.posts,
+        next_cursor: page.next_cursor,
+    }))
+}
+
 async fn create_user_post(
     State((state, _config)): State<(Arc<AppState>, ServerConfig)>,
     Path(path): Path<UsernamePath>,
@@ -314,7 +358,7 @@ async fn create_user_post(
     if session_actor.profile.username != path.username {
         return Err(ApiError::Forbidden("cannot post as another user"));
     }
-    ensure_same_origin(&headers, &state.public_base_url)?;
+    ensure_same_origin(&headers, &state.public_base_url, &state.allowed_origins)?;
     state
         .rate_limiter
         .check(
@@ -347,6 +391,90 @@ async fn create_user_post(
     state.db.posts().create(&post).await?;
     enqueue_create_deliveries(&state.db, &actor, &post, &RetryPolicy::default()).await?;
     Ok((StatusCode::CREATED, Json(post)))
+}
+
+async fn post_follow(
+    State((state, _config)): State<(Arc<AppState>, ServerConfig)>,
+    Path(path): Path<UsernamePath>,
+    headers: HeaderMap,
+    Json(request): Json<FollowRequest>,
+) -> Result<(StatusCode, Json<FollowResponse>), ApiError> {
+    let local_actor = require_actor_for_mutation(&state, &headers, &path.username).await?;
+    state
+        .rate_limiter
+        .check(
+            format!(
+                "follow:{}:{}",
+                client_rate_key(&headers),
+                local_actor.profile.username
+            ),
+            RateLimitSpec {
+                limit: 30,
+                window: Duration::from_secs(60),
+            },
+        )
+        .await?;
+
+    let discovery = discover_remote_actor(state.remote_client(), &request.resource).await?;
+    state.db.remote_actors().upsert(&discovery.actor).await?;
+    let job = kodamapub_job::enqueue_follow_delivery(
+        &state.db,
+        &local_actor,
+        &discovery.actor,
+        &RetryPolicy::default(),
+    )
+    .await?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(FollowResponse {
+            remote_actor: discovery.actor.profile,
+            state: kodamapub_domain::FollowState::Pending,
+            job_id: job.id.0.to_string(),
+        }),
+    ))
+}
+
+async fn delete_follow(
+    State((state, _config)): State<(Arc<AppState>, ServerConfig)>,
+    Path(path): Path<UsernamePath>,
+    headers: HeaderMap,
+    Json(request): Json<FollowRequest>,
+) -> Result<(StatusCode, Json<FollowResponse>), ApiError> {
+    let local_actor = require_actor_for_mutation(&state, &headers, &path.username).await?;
+    state
+        .rate_limiter
+        .check(
+            format!(
+                "unfollow:{}:{}",
+                client_rate_key(&headers),
+                local_actor.profile.username
+            ),
+            RateLimitSpec {
+                limit: 30,
+                window: Duration::from_secs(60),
+            },
+        )
+        .await?;
+
+    let discovery = discover_remote_actor(state.remote_client(), &request.resource).await?;
+    state.db.remote_actors().upsert(&discovery.actor).await?;
+    let job = kodamapub_job::enqueue_unfollow_delivery(
+        &state.db,
+        &local_actor,
+        &discovery.actor,
+        &RetryPolicy::default(),
+    )
+    .await?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(FollowResponse {
+            remote_actor: discovery.actor.profile,
+            state: kodamapub_domain::FollowState::Rejected,
+            job_id: job.id.0.to_string(),
+        }),
+    ))
 }
 
 async fn get_actor(
@@ -485,7 +613,7 @@ async fn post_login(
     headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
-    ensure_same_origin(&headers, &state.public_base_url)?;
+    ensure_same_origin(&headers, &state.public_base_url, &state.allowed_origins)?;
     state
         .rate_limiter
         .check(
@@ -552,7 +680,7 @@ async fn post_logout(
 ) -> Result<Response, ApiError> {
     if let Some(token) = session_token_from_headers(&headers) {
         if let Some(session) = state.db.sessions().find(&token).await? {
-            ensure_same_origin(&headers, &state.public_base_url)?;
+            ensure_same_origin(&headers, &state.public_base_url, &state.allowed_origins)?;
             ensure_csrf_token(&headers, &session.csrf_token)?;
             state.db.sessions().delete(&token).await?;
         }
@@ -639,9 +767,24 @@ fn ensure_csrf_token(headers: &HeaderMap, expected: &str) -> Result<(), ApiError
     Ok(())
 }
 
+async fn require_actor_for_mutation(
+    state: &AppState,
+    headers: &HeaderMap,
+    username: &Username,
+) -> Result<kodamapub_domain::LocalActor, ApiError> {
+    let session = require_authenticated_session(state, headers).await?;
+    let session_actor = find_local_actor_by_id(state, session.actor_id).await?;
+    if session_actor.profile.username != *username {
+        return Err(ApiError::Forbidden("cannot mutate another user"));
+    }
+    ensure_same_origin(headers, &state.public_base_url, &state.allowed_origins)?;
+    Ok(session_actor)
+}
+
 fn ensure_same_origin(
     headers: &HeaderMap,
     public_base_url: &PublicBaseUrl,
+    allowed_origins: &[String],
 ) -> Result<(), ApiError> {
     let Some(origin) = headers
         .get(header::ORIGIN)
@@ -650,7 +793,11 @@ fn ensure_same_origin(
         return Err(ApiError::Forbidden("origin is required"));
     };
 
-    if !same_origin(origin, public_base_url.as_str()) {
+    if !same_origin(origin, public_base_url.as_str())
+        && !allowed_origins
+            .iter()
+            .any(|allowed| same_origin(origin, allowed))
+    {
         return Err(ApiError::Forbidden("origin is not allowed"));
     }
 
@@ -668,6 +815,15 @@ fn same_origin(candidate: &str, expected: &str) -> bool {
     candidate.scheme() == expected.scheme()
         && candidate.host_str() == expected.host_str()
         && candidate.port_or_known_default() == expected.port_or_known_default()
+}
+
+fn parse_allowed_origins(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn client_rate_key(headers: &HeaderMap) -> String {
@@ -936,6 +1092,9 @@ async fn main() -> anyhow::Result<()> {
     let public_base_url = std::env::var("PUBLIC_BASE_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string())
         .parse()?;
+    let allowed_origins = std::env::var("KODAMAPUB_ALLOWED_ORIGINS")
+        .map(|value| parse_allowed_origins(&value))
+        .unwrap_or_default();
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
 
     let db = Database::connect(&database_url).await?;
@@ -944,6 +1103,7 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         db,
         public_base_url,
+        allowed_origins,
         remote_client: build_remote_client(),
         rate_limiter: RateLimiter::new(),
     });
@@ -1191,6 +1351,7 @@ mod tests {
         let state = Arc::new(AppState {
             db,
             public_base_url: "https://example.invalid".parse().expect("public base url"),
+            allowed_origins: Vec::new(),
             remote_client: build_remote_client(),
             rate_limiter: RateLimiter::new(),
         });

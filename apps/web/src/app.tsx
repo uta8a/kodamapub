@@ -10,15 +10,18 @@ import {
 import { Link, Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import {
   createPost,
+  followRemote,
   getActor,
   getPost,
   getSession,
   listPosts,
+  listTimeline,
   login,
   logout,
   setCsrfToken,
+  unfollowRemote,
 } from "./api";
-import type { ActorProfile, Post } from "./types";
+import type { ActorProfile, FollowResponse, Post } from "./types";
 
 const defaultUsername = import.meta.env.VITE_DEFAULT_USERNAME ?? "alice";
 
@@ -196,7 +199,7 @@ function AppShell({
   );
 }
 
-function FeedCard({ post, username }: { post: Post; username: string }) {
+function FeedCard({ post, linkUsername }: { post: Post; linkUsername: string | null }) {
   const body = useMemo(() => ({ __html: post.content_html }), [post.content_html]);
 
   return (
@@ -204,11 +207,16 @@ function FeedCard({ post, username }: { post: Post; username: string }) {
       <div className="post-meta">
         <span>{formatVisibility(post.visibility)}</span>
         <span>{formatContentFormat(post.content_format)}</span>
+        {!linkUsername ? <span>actor {post.actor_id}</span> : null}
         <time dateTime={post.created_at}>{formatDate(post.created_at)}</time>
       </div>
       <div className="post-body" dangerouslySetInnerHTML={body} />
       <div className="post-footer">
-        <Link to={postPath(username, post.id)}>開く</Link>
+        {linkUsername ? (
+          <Link to={postPath(linkUsername, post.id)}>開く</Link>
+        ) : (
+          <a href={post.url}>開く</a>
+        )}
         <span className="muted">{post.url}</span>
       </div>
     </article>
@@ -310,6 +318,79 @@ function Composer({ username, onCreated }: { username: string; onCreated: (post:
   );
 }
 
+function FollowPanel({ username }: { username: string }) {
+  const [resource, setResource] = useState("");
+  const [isSaving, setIsSaving] = useState<"follow" | "unfollow" | null>(null);
+  const [result, setResult] = useState<FollowResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit(action: "follow" | "unfollow") {
+    const trimmed = resource.trim();
+    if (!trimmed) {
+      setError("フォロー先を入力してください。");
+      return;
+    }
+
+    setIsSaving(action);
+    setError(null);
+
+    try {
+      const response =
+        action === "follow"
+          ? await followRemote(username, trimmed)
+          : await unfollowRemote(username, trimmed);
+      setResult(response);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "フォロー操作に失敗しました。");
+    } finally {
+      setIsSaving(null);
+    }
+  }
+
+  return (
+    <section className="panel follow-panel">
+      <div className="panel-header">
+        <h2>Follow</h2>
+        <span>リモートアクターを操作</span>
+      </div>
+
+      <form
+        className="follow-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void submit("follow");
+        }}
+      >
+        <label>
+          <span>フォロー先</span>
+          <input
+            value={resource}
+            onChange={(event) => setResource(event.target.value)}
+            placeholder="acct:e2e@mastodon.e2e:3001 または actor URL"
+            spellCheck={false}
+          />
+        </label>
+
+        <div className="button-row">
+          <button type="submit" disabled={isSaving !== null}>
+            {isSaving === "follow" ? "送信中..." : "Follow"}
+          </button>
+          <button type="button" disabled={isSaving !== null} onClick={() => void submit("unfollow")}>
+            {isSaving === "unfollow" ? "送信中..." : "Unfollow"}
+          </button>
+        </div>
+
+        {result ? (
+          <p className="summary">
+            {result.remote_actor.display_name} @{result.remote_actor.username}: {result.state}
+          </p>
+        ) : null}
+        {error ? <p className="error">{error}</p> : null}
+      </form>
+    </section>
+  );
+}
+
 function normalizeHandle(handle: string | undefined): string {
   return handle?.startsWith("@") ? handle.slice(1).trim() : handle?.trim() ?? "";
 }
@@ -333,11 +414,13 @@ function TimelinePage({
   title,
   subtitle,
   composerUsername,
+  mode = "profile",
 }: {
   username: string;
   title: string;
   subtitle: string;
   composerUsername?: string;
+  mode?: "profile" | "home";
 }) {
   const [actor, setActor] = useState<ActorProfile | null>(null);
   const [posts, setPosts] = useState<Post[]>([]);
@@ -354,7 +437,10 @@ function TimelinePage({
       setPosts([]);
       setNextCursor(null);
       try {
-        const [actorData, postPage] = await Promise.all([getActor(username), listPosts(username)]);
+        const [actorData, postPage] = await Promise.all([
+          getActor(username),
+          mode === "home" ? listTimeline(username) : listPosts(username),
+        ]);
         if (cancelled) {
           return;
         }
@@ -373,7 +459,7 @@ function TimelinePage({
     return () => {
       cancelled = true;
     };
-  }, [username]);
+  }, [username, mode]);
 
   async function loadMore() {
     if (!nextCursor) {
@@ -384,7 +470,10 @@ function TimelinePage({
     setError(null);
 
     try {
-      const page = await listPosts(username, { before: nextCursor });
+      const page =
+        mode === "home"
+          ? await listTimeline(username, { before: nextCursor })
+          : await listPosts(username, { before: nextCursor });
       setPosts((current) => [...current, ...page.posts]);
       setNextCursor(page.next_cursor);
     } catch (cause) {
@@ -432,12 +521,15 @@ function TimelinePage({
       </section>
 
       {composerUsername ? (
-        <Composer
-          username={composerUsername}
-          onCreated={(post) => {
-            setPosts((current) => [post, ...current]);
-          }}
-        />
+        <>
+          <Composer
+            username={composerUsername}
+            onCreated={(post) => {
+              setPosts((current) => [post, ...current]);
+            }}
+          />
+          <FollowPanel username={composerUsername} />
+        </>
       ) : null}
 
       <section className="panel feed-panel">
@@ -446,11 +538,23 @@ function TimelinePage({
           <span>{posts.length} 件</span>
         </div>
 
+        {mode === "home" ? (
+          <p className="summary timeline-summary">
+            自分の投稿と、Active な follow 先から inbox に届いた投稿を表示します。
+          </p>
+        ) : null}
+
         <div className="feed-list">
           {posts.length === 0 ? (
             <p className="muted">まだ投稿がありません。</p>
           ) : (
-            posts.map((post) => <FeedCard key={post.id} post={post} username={username} />)
+            posts.map((post) => (
+              <FeedCard
+                key={post.id}
+                post={post}
+                linkUsername={mode === "profile" || post.actor_id === actor?.id ? username : null}
+              />
+            ))
           )}
         </div>
 
@@ -481,8 +585,9 @@ function HomePage() {
     <TimelinePage
       username={actor.username}
       title="ホーム"
-      subtitle={`@${actor.username} に見える投稿を並べています。`}
+      subtitle={`@${actor.username} のタイムラインです。`}
       composerUsername={actor.username}
+      mode="home"
     />
   );
 }
@@ -546,7 +651,7 @@ function PostPage() {
         {error ? (
           <p className="error">{error}</p>
         ) : post ? (
-          <FeedCard post={post} username={username} />
+          <FeedCard post={post} linkUsername={username} />
         ) : (
           <p className="muted">投稿を読み込み中...</p>
         )}

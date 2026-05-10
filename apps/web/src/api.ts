@@ -1,4 +1,11 @@
-import type { ActorProfile, CreatePostInput, Post, PostPage, SessionPayload } from "./types";
+import type {
+  ActorProfile,
+  CreatePostInput,
+  FollowResponse,
+  Post,
+  PostPage,
+  SessionPayload,
+} from "./types";
 
 export type LoginInput = {
   username: string;
@@ -51,6 +58,19 @@ export async function listPosts(
   return request(`/api/users/${encodeURIComponent(username)}/posts?${params.toString()}`);
 }
 
+export async function listTimeline(
+  username: string,
+  options?: { limit?: number; before?: string | null },
+): Promise<PostPage> {
+  const params = new URLSearchParams();
+  params.set("limit", String(options?.limit ?? 20));
+  if (options?.before) {
+    params.set("before", options.before);
+  }
+
+  return request(`/api/users/${encodeURIComponent(username)}/timeline?${params.toString()}`);
+}
+
 export async function getPost(postId: string): Promise<Post> {
   return request(`/api/posts/${encodeURIComponent(postId)}`);
 }
@@ -59,6 +79,20 @@ export async function createPost(username: string, input: CreatePostInput): Prom
   return request(`/api/users/${encodeURIComponent(username)}/posts`, {
     method: "POST",
     body: JSON.stringify(input),
+  });
+}
+
+export async function followRemote(username: string, resource: string): Promise<FollowResponse> {
+  return request(`/api/users/${encodeURIComponent(username)}/follows`, {
+    method: "POST",
+    body: JSON.stringify({ resource }),
+  });
+}
+
+export async function unfollowRemote(username: string, resource: string): Promise<FollowResponse> {
+  return request(`/api/users/${encodeURIComponent(username)}/follows`, {
+    method: "DELETE",
+    body: JSON.stringify({ resource }),
   });
 }
 

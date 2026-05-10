@@ -8,6 +8,7 @@ A minimal ActivityPub implementation for personal use.
 - Default frontend user: `VITE_DEFAULT_USERNAME=alice`
 - Docker stack: `docker compose up --build` then open `http://localhost:8080`
 - Mise task: `mise run compose-up`
+- Mastodon UI E2E on kind: see `docs/mastodon-kind-e2e.md`
 
 ## Production
 

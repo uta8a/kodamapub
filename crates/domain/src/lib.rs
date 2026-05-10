@@ -97,6 +97,7 @@ pub enum DeliveryKind {
     Follow,
     Create,
     Accept,
+    Undo,
 }
 
 fn validate_nonempty_string(

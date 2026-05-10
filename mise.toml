@@ -1,3 +1,8 @@
+[tools]
+kind = "0.31.0"
+kubectl = "1.36.0"
+helm = "3.20.2"
+
 [tasks.compose-up]
 description = "Start the local docker compose stack"
 run = "env PUBLIC_BASE_URL=https://app.localhost docker compose up --build"
@@ -32,3 +37,31 @@ mise run fmt-web
 [tasks.seed-demo]
 description = "Seed demo user and posts into the running docker compose stack"
 run = "docker compose exec -T server cargo run -p kodamapub-cli -- seed-demo"
+
+[tasks.kind-mastodon-up]
+description = "Start a kind cluster with kodamapub and Magout-managed Mastodon"
+run = "scripts/kind/mastodon-e2e.sh up"
+
+[tasks.kind-mastodon-seed]
+description = "Seed alice in kodamapub and e2e in Mastodon"
+run = "scripts/kind/mastodon-e2e.sh seed"
+
+[tasks.kind-mastodon-test]
+description = "Run the Mastodon interoperability E2E flow in kind"
+run = "scripts/kind/mastodon-e2e.sh test"
+
+[tasks.kind-mastodon-port-forward]
+description = "Forward local UI ports for the kind Mastodon E2E stack"
+run = "scripts/kind/mastodon-e2e.sh port-forward"
+
+[tasks.kind-mastodon-status]
+description = "Show resources for the kind Mastodon E2E stack"
+run = "scripts/kind/mastodon-e2e.sh status"
+
+[tasks.kind-mastodon-logs]
+description = "Follow logs for the kind Mastodon E2E stack"
+run = "scripts/kind/mastodon-e2e.sh logs"
+
+[tasks.kind-mastodon-down]
+description = "Delete the kind Mastodon E2E cluster"
+run = "scripts/kind/mastodon-e2e.sh down"

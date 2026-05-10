@@ -145,7 +145,7 @@ pub struct UndoActivity {
     #[serde(rename = "type")]
     pub object_type: String,
     pub actor: Url,
-    pub object: Url,
+    pub object: FollowActivity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -191,8 +191,8 @@ pub struct OrderedCollectionPage {
 pub struct WebFingerLink {
     pub rel: String,
     #[serde(rename = "type")]
-    pub media_type: String,
-    pub href: Url,
+    pub media_type: Option<String>,
+    pub href: Option<Url>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -302,6 +302,24 @@ pub async fn discover_remote_actor(
     client: &Client,
     resource: &str,
 ) -> Result<RemoteActorDiscovery, ActivityPubError> {
+    if let Ok(actor_url) = Url::parse(resource) {
+        if actor_url.scheme() != "http" && actor_url.scheme() != "https" {
+            return discover_remote_actor_by_webfinger(client, resource).await;
+        }
+        let actor = fetch_remote_actor(client, &actor_url).await?;
+        return Ok(RemoteActorDiscovery {
+            resource: resource.to_string(),
+            actor,
+        });
+    }
+
+    discover_remote_actor_by_webfinger(client, resource).await
+}
+
+async fn discover_remote_actor_by_webfinger(
+    client: &Client,
+    resource: &str,
+) -> Result<RemoteActorDiscovery, ActivityPubError> {
     let (_username, host) = parse_acct_resource(resource)?;
     let webfinger_url = webfinger_url_for_host(&host, resource)?;
 
@@ -318,7 +336,7 @@ pub async fn discover_remote_actor(
         .links
         .iter()
         .find(|link| link.rel == "self")
-        .map(|link| link.href.clone())
+        .and_then(|link| link.href.clone())
         .ok_or_else(|| {
             ActivityPubError::InvalidResource("webfinger self link missing".to_string())
         })?;
@@ -549,6 +567,19 @@ pub fn accept_activity(
     }
 }
 
+pub fn undo_follow_activity(
+    local_actor: &LocalActor,
+    remote_actor: &RemoteActor,
+) -> UndoActivity {
+    UndoActivity {
+        context: ACTIVITY_STREAMS_CONTEXT.to_string(),
+        id: undo_activity_id(&local_actor.profile.actor_url, &remote_actor.profile.actor_url),
+        object_type: "Undo".to_string(),
+        actor: local_actor.profile.actor_url.clone(),
+        object: follow_activity(local_actor, remote_actor),
+    }
+}
+
 pub fn ordered_collection(id: Url, first: Option<Url>, total_items: u64) -> OrderedCollection {
     OrderedCollection {
         context: ACTIVITY_STREAMS_CONTEXT.to_string(),
@@ -580,8 +611,8 @@ pub fn webfinger_response(subject: String, actor_url: Url) -> WebFingerResponse 
         subject,
         links: vec![WebFingerLink {
             rel: "self".to_string(),
-            media_type: "application/activity+json".to_string(),
-            href: actor_url,
+            media_type: Some("application/activity+json".to_string()),
+            href: Some(actor_url),
         }],
     }
 }
@@ -1158,6 +1189,16 @@ fn accept_activity_id(
         Uuid::now_v7()
     ))
     .expect("accept activity URL")
+}
+
+fn undo_activity_id(local_actor_url: &Url, remote_actor_url: &Url) -> Url {
+    Url::parse(&format!(
+        "{}#undo-follow-{}-{}",
+        local_actor_url.as_str(),
+        sanitize_for_fragment(remote_actor_url.host_str().unwrap_or("remote")),
+        Uuid::now_v7()
+    ))
+    .expect("undo activity URL")
 }
 
 fn sanitize_for_fragment(value: &str) -> String {

@@ -36,3 +36,11 @@ export type PostPage = {
   posts: Post[];
   next_cursor: string | null;
 };
+
+export type FollowState = "Pending" | "Active" | "Rejected";
+
+export type FollowResponse = {
+  remote_actor: ActorProfile;
+  state: FollowState;
+  job_id: string;
+};
