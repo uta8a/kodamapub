@@ -30,17 +30,43 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64" -o kind
-          chmod +x kind
-          sudo mv kind /usr/local/bin/kind
 
-          curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" -o kubectl
-          chmod +x kubectl
-          sudo mv kubectl /usr/local/bin/kubectl
+          download() {
+            local output="$1"
+            shift
 
-          curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" -o helm.tar.gz
-          tar -xzf helm.tar.gz
-          sudo mv linux-amd64/helm /usr/local/bin/helm
+            local url
+            for url in "$@"; do
+              if curl --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 20 -fsSL "$url" -o "$output"; then
+                return 0
+              fi
+            done
+
+            return 1
+          }
+
+          if ! command -v kind >/dev/null 2>&1; then
+            download kind \
+              "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64" \
+              "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+            chmod +x kind
+            sudo mv kind /usr/local/bin/kind
+          fi
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            download kubectl \
+              "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+              "https://storage.googleapis.com/kubernetes-release/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+            chmod +x kubectl
+            sudo mv kubectl /usr/local/bin/kubectl
+          fi
+
+          if ! command -v helm >/dev/null 2>&1; then
+            download helm.tar.gz \
+              "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+            tar -xzf helm.tar.gz
+            sudo mv linux-amd64/helm /usr/local/bin/helm
+          fi
 
       - name: Run Mastodon E2E
         shell: bash
