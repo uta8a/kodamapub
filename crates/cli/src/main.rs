@@ -29,7 +29,7 @@ enum Command {
     CreateLocalActor {
         #[arg(long, env = "DATABASE_URL", default_value = "sqlite://kodamapub.db")]
         database_url: String,
-        #[arg(long, env = "PUBLIC_BASE_URL", default_value = "http://127.0.0.1:3000")]
+        #[arg(long, env = "PUBLIC_BASE_URL")]
         public_base_url: PublicBaseUrl,
         #[arg(long)]
         username: Username,
@@ -51,7 +51,7 @@ enum Command {
     SeedDemo {
         #[arg(long, env = "DATABASE_URL", default_value = "sqlite://kodamapub.db")]
         database_url: String,
-        #[arg(long, env = "PUBLIC_BASE_URL", default_value = "http://127.0.0.1:8080")]
+        #[arg(long, env = "PUBLIC_BASE_URL")]
         public_base_url: PublicBaseUrl,
         #[arg(long, default_value = "alice")]
         username: Username,

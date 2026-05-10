@@ -1090,7 +1090,7 @@ async fn main() -> anyhow::Result<()> {
     let database_url =
         std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://kodamapub.db".to_string());
     let public_base_url = std::env::var("PUBLIC_BASE_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string())
+        .map_err(|_| anyhow::anyhow!("PUBLIC_BASE_URL must be set"))?
         .parse()?;
     let allowed_origins = std::env::var("KODAMAPUB_ALLOWED_ORIGINS")
         .map(|value| parse_allowed_origins(&value))
