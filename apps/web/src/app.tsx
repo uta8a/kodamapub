@@ -10,6 +10,7 @@ import {
 import { Link, Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import {
   createPost,
+  followRemote,
   getActor,
   getPost,
   getSession,
@@ -17,8 +18,9 @@ import {
   login,
   logout,
   setCsrfToken,
+  unfollowRemote,
 } from "./api";
-import type { ActorProfile, Post } from "./types";
+import type { ActorProfile, FollowResponse, Post } from "./types";
 
 const defaultUsername = import.meta.env.VITE_DEFAULT_USERNAME ?? "alice";
 
@@ -310,6 +312,79 @@ function Composer({ username, onCreated }: { username: string; onCreated: (post:
   );
 }
 
+function FollowPanel({ username }: { username: string }) {
+  const [resource, setResource] = useState("");
+  const [isSaving, setIsSaving] = useState<"follow" | "unfollow" | null>(null);
+  const [result, setResult] = useState<FollowResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit(action: "follow" | "unfollow") {
+    const trimmed = resource.trim();
+    if (!trimmed) {
+      setError("フォロー先を入力してください。");
+      return;
+    }
+
+    setIsSaving(action);
+    setError(null);
+
+    try {
+      const response =
+        action === "follow"
+          ? await followRemote(username, trimmed)
+          : await unfollowRemote(username, trimmed);
+      setResult(response);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "フォロー操作に失敗しました。");
+    } finally {
+      setIsSaving(null);
+    }
+  }
+
+  return (
+    <section className="panel follow-panel">
+      <div className="panel-header">
+        <h2>Follow</h2>
+        <span>リモートアクターを操作</span>
+      </div>
+
+      <form
+        className="follow-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void submit("follow");
+        }}
+      >
+        <label>
+          <span>フォロー先</span>
+          <input
+            value={resource}
+            onChange={(event) => setResource(event.target.value)}
+            placeholder="acct:e2e@mastodon.e2e:3001 または actor URL"
+            spellCheck={false}
+          />
+        </label>
+
+        <div className="button-row">
+          <button type="submit" disabled={isSaving !== null}>
+            {isSaving === "follow" ? "送信中..." : "Follow"}
+          </button>
+          <button type="button" disabled={isSaving !== null} onClick={() => void submit("unfollow")}>
+            {isSaving === "unfollow" ? "送信中..." : "Unfollow"}
+          </button>
+        </div>
+
+        {result ? (
+          <p className="summary">
+            {result.remote_actor.display_name} @{result.remote_actor.username}: {result.state}
+          </p>
+        ) : null}
+        {error ? <p className="error">{error}</p> : null}
+      </form>
+    </section>
+  );
+}
+
 function normalizeHandle(handle: string | undefined): string {
   return handle?.startsWith("@") ? handle.slice(1).trim() : handle?.trim() ?? "";
 }
@@ -432,12 +507,15 @@ function TimelinePage({
       </section>
 
       {composerUsername ? (
-        <Composer
-          username={composerUsername}
-          onCreated={(post) => {
-            setPosts((current) => [post, ...current]);
-          }}
-        />
+        <>
+          <Composer
+            username={composerUsername}
+            onCreated={(post) => {
+              setPosts((current) => [post, ...current]);
+            }}
+          />
+          <FollowPanel username={composerUsername} />
+        </>
       ) : null}
 
       <section className="panel feed-panel">

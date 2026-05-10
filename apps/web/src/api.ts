@@ -1,4 +1,11 @@
-import type { ActorProfile, CreatePostInput, Post, PostPage, SessionPayload } from "./types";
+import type {
+  ActorProfile,
+  CreatePostInput,
+  FollowResponse,
+  Post,
+  PostPage,
+  SessionPayload,
+} from "./types";
 
 export type LoginInput = {
   username: string;
@@ -59,6 +66,20 @@ export async function createPost(username: string, input: CreatePostInput): Prom
   return request(`/api/users/${encodeURIComponent(username)}/posts`, {
     method: "POST",
     body: JSON.stringify(input),
+  });
+}
+
+export async function followRemote(username: string, resource: string): Promise<FollowResponse> {
+  return request(`/api/users/${encodeURIComponent(username)}/follows`, {
+    method: "POST",
+    body: JSON.stringify({ resource }),
+  });
+}
+
+export async function unfollowRemote(username: string, resource: string): Promise<FollowResponse> {
+  return request(`/api/users/${encodeURIComponent(username)}/follows`, {
+    method: "DELETE",
+    body: JSON.stringify({ resource }),
   });
 }
 

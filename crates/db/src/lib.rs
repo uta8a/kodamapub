@@ -1170,6 +1170,7 @@ fn delivery_kind_to_db(kind: &DeliveryKind) -> &'static str {
         DeliveryKind::Follow => "follow",
         DeliveryKind::Create => "create",
         DeliveryKind::Accept => "accept",
+        DeliveryKind::Undo => "undo",
     }
 }
 
@@ -1178,6 +1179,7 @@ fn delivery_kind_from_db(value: &str) -> Result<DeliveryKind, DbError> {
         "follow" => Ok(DeliveryKind::Follow),
         "create" => Ok(DeliveryKind::Create),
         "accept" => Ok(DeliveryKind::Accept),
+        "undo" => Ok(DeliveryKind::Undo),
         _ => Err(DbError::UnknownDeliveryKind(value.to_string())),
     }
 }
