@@ -1,6 +1,6 @@
 use argon2::{
     Argon2,
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
 use chrono::{DateTime, Utc};
 use kodamapub_domain::{
@@ -8,6 +8,7 @@ use kodamapub_domain::{
     FollowRelation, FollowState, LocalActor, Post, PostId, RemoteActor, Summary, TextValueError,
     Username, UsernameError, Visibility,
 };
+use rand_core::OsRng;
 use sqlx::{Row, SqlitePool, migrate::Migrator};
 use thiserror::Error;
 use url::Url;
@@ -266,6 +267,17 @@ impl<'a> RemoteActorRepository<'a> {
         .execute(&mut *tx)
         .await?;
 
+        let actor_id = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            select id
+            from actors
+            where actor_url = $1
+            "#,
+        )
+        .bind(actor.profile.actor_url.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+
         sqlx::query(
             r#"
             insert into remote_actor_state (actor_id, public_key_pem, fetched_at)
@@ -275,7 +287,7 @@ impl<'a> RemoteActorRepository<'a> {
                 fetched_at = excluded.fetched_at
             "#,
         )
-        .bind(actor.id().0)
+        .bind(actor_id)
         .bind(&actor.public_key_pem)
         .bind(actor.fetched_at)
         .execute(&mut *tx)
@@ -694,6 +706,87 @@ impl<'a> PostRepository<'a> {
                     "#,
                 )
                 .bind(actor_id.0)
+                .bind(limit + 1)
+                .fetch_all(self.pool)
+                .await?
+            }
+        };
+
+        let mut posts: Vec<Post> = rows
+            .into_iter()
+            .map(post_from_row)
+            .collect::<Result<_, _>>()?;
+        let next_cursor = if posts.len() > limit as usize {
+            posts.pop().expect("extra post for pagination");
+            posts.last().map(|post| post.id)
+        } else {
+            None
+        };
+
+        Ok(PostPage { posts, next_cursor })
+    }
+
+    pub async fn list_home_timeline(
+        &self,
+        local_actor_id: ActorId,
+        before: Option<PostId>,
+        limit: i64,
+    ) -> Result<PostPage, DbError> {
+        let rows = match before {
+            Some(before) => {
+                let before_post = self.find(before).await?.ok_or(sqlx::Error::RowNotFound)?;
+
+                sqlx::query(
+                    r#"
+                    select
+                        p.id, p.actor_id, p.url, p.content_source, p.content_format,
+                        p.content_html, p.visibility, p.in_reply_to, p.created_at
+                    from posts p
+                    where (
+                        p.actor_id = $1
+                        or exists (
+                            select 1
+                            from follows f
+                            where f.local_actor_id = $1
+                              and f.remote_actor_id = p.actor_id
+                              and f.state = 'active'
+                        )
+                      )
+                      and (
+                        p.created_at < $2
+                        or (p.created_at = $2 and p.id < $3)
+                      )
+                    order by p.created_at desc, p.id desc
+                    limit $4
+                    "#,
+                )
+                .bind(local_actor_id.0)
+                .bind(before_post.created_at)
+                .bind(before_post.id.0)
+                .bind(limit + 1)
+                .fetch_all(self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    r#"
+                    select
+                        p.id, p.actor_id, p.url, p.content_source, p.content_format,
+                        p.content_html, p.visibility, p.in_reply_to, p.created_at
+                    from posts p
+                    where p.actor_id = $1
+                       or exists (
+                            select 1
+                            from follows f
+                            where f.local_actor_id = $1
+                              and f.remote_actor_id = p.actor_id
+                              and f.state = 'active'
+                       )
+                    order by p.created_at desc, p.id desc
+                    limit $2
+                    "#,
+                )
+                .bind(local_actor_id.0)
                 .bind(limit + 1)
                 .fetch_all(self.pool)
                 .await?
@@ -1220,7 +1313,8 @@ pub fn hash_password(password: &str) -> Result<String, AuthError> {
 }
 
 pub fn verify_password(password: &str, password_hash: &str) -> Result<bool, AuthError> {
-    let parsed = PasswordHash::new(password_hash).map_err(|error| AuthError::Hash(error.to_string()))?;
+    let parsed =
+        PasswordHash::new(password_hash).map_err(|error| AuthError::Hash(error.to_string()))?;
     Ok(Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok())
@@ -1294,6 +1388,41 @@ mod tests {
             ),
             public_key_pem: "PUBLIC KEY".to_string(),
             private_key_pem: "PRIVATE KEY".to_string(),
+        }
+    }
+
+    fn sample_remote_actor(username: &str, domain: &str) -> RemoteActor {
+        RemoteActor {
+            profile: ActorProfile::new(
+                username.parse().expect("username"),
+                username.parse().expect("display name"),
+                Some("remote actor".parse().expect("summary")),
+                Url::parse(&format!("https://{domain}/users/{username}")).expect("actor url"),
+                Some(
+                    Url::parse(&format!("https://{domain}/users/{username}/inbox"))
+                        .expect("inbox url"),
+                ),
+                Some(
+                    Url::parse(&format!("https://{domain}/users/{username}/outbox"))
+                        .expect("outbox url"),
+                ),
+            ),
+            public_key_pem: Some("REMOTE PUBLIC KEY".to_string()),
+            fetched_at: Utc::now(),
+        }
+    }
+
+    fn sample_post(actor_id: ActorId, url: &str, content: &str) -> Post {
+        Post {
+            id: PostId::new(),
+            actor_id,
+            url: Url::parse(url).expect("post url"),
+            content_source: content.parse().expect("content source"),
+            content_format: ContentFormat::Plaintext,
+            content_html: content.to_string(),
+            visibility: Visibility::Public,
+            in_reply_to: None,
+            created_at: Utc::now(),
         }
     }
 
@@ -1463,6 +1592,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_home_timeline_includes_local_and_active_follow_posts_only() {
+        let db = memory_db().await;
+        let local_actor = sample_local_actor();
+        let active_remote = sample_remote_actor("bob", "remote.example");
+        let pending_remote = sample_remote_actor("carol", "other.example");
+
+        db.local_actors()
+            .create(&local_actor)
+            .await
+            .expect("create local actor");
+        db.remote_actors()
+            .upsert(&active_remote)
+            .await
+            .expect("upsert active remote");
+        db.remote_actors()
+            .upsert(&pending_remote)
+            .await
+            .expect("upsert pending remote");
+
+        let local_post = sample_post(
+            local_actor.id(),
+            "https://example.invalid/posts/local",
+            "local post",
+        );
+        let active_remote_post = sample_post(
+            active_remote.id(),
+            "https://remote.example/users/bob/statuses/1",
+            "active remote post",
+        );
+        let pending_remote_post = sample_post(
+            pending_remote.id(),
+            "https://other.example/users/carol/statuses/1",
+            "pending remote post",
+        );
+
+        db.posts()
+            .create(&local_post)
+            .await
+            .expect("insert local post");
+        db.posts()
+            .upsert_remote(&active_remote_post)
+            .await
+            .expect("insert active remote post");
+        db.posts()
+            .upsert_remote(&pending_remote_post)
+            .await
+            .expect("insert pending remote post");
+
+        let mut active_follow = FollowRelation::new(local_actor.id(), &active_remote);
+        active_follow.state = FollowState::Active;
+        let pending_follow = FollowRelation::new(local_actor.id(), &pending_remote);
+        db.follows()
+            .upsert(&active_follow)
+            .await
+            .expect("upsert active follow");
+        db.follows()
+            .upsert(&pending_follow)
+            .await
+            .expect("upsert pending follow");
+
+        let page = db
+            .posts()
+            .list_home_timeline(local_actor.id(), None, 10)
+            .await
+            .expect("home timeline");
+
+        let contents: Vec<_> = page
+            .posts
+            .iter()
+            .map(|post| post.content_source.as_str())
+            .collect();
+        assert!(contents.contains(&"local post"));
+        assert!(contents.contains(&"active remote post"));
+        assert!(!contents.contains(&"pending remote post"));
+    }
+
+    #[tokio::test]
     async fn follow_repository_round_trips_and_lists_active_remote_actors() {
         let db = memory_db().await;
         let local_actor = sample_local_actor();
@@ -1472,18 +1678,7 @@ mod tests {
             .await
             .expect("create local actor");
 
-        let remote_actor = RemoteActor {
-            profile: ActorProfile::new(
-                "bob".parse().expect("username"),
-                "Bob".parse().expect("display name"),
-                Some("remote actor".parse().expect("summary")),
-                Url::parse("https://remote.example/users/bob").expect("actor url"),
-                Some(Url::parse("https://remote.example/users/bob/inbox").expect("inbox url")),
-                Some(Url::parse("https://remote.example/users/bob/outbox").expect("outbox url")),
-            ),
-            public_key_pem: Some("REMOTE PUBLIC KEY".to_string()),
-            fetched_at: Utc::now(),
-        };
+        let remote_actor = sample_remote_actor("bob", "remote.example");
 
         db.remote_actors()
             .upsert(&remote_actor)
@@ -1559,7 +1754,10 @@ mod tests {
             .expect("remote actor exists");
 
         assert_eq!(found.profile.actor_url, remote_actor.profile.actor_url);
-        assert_eq!(found.profile.display_name, updated_remote_actor.profile.display_name);
+        assert_eq!(
+            found.profile.display_name,
+            updated_remote_actor.profile.display_name
+        );
         assert_eq!(found.public_key_pem, updated_remote_actor.public_key_pem);
     }
 

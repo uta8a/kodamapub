@@ -17,15 +17,17 @@ use chrono::{Duration as ChronoDuration, Utc};
 use kodamapub_activitypub::{
     IncomingActivity, discover_remote_actor, fetch_remote_actor, is_publicly_visible,
     local_actor_to_object, ordered_collection, ordered_collection_page, parse_incoming_activity,
-    post_to_create_activity, post_to_note, signature_key_id_actor_url, verify_incoming_activity_signature,
-    webfinger_response,
+    post_to_create_activity, post_to_note, signature_key_id_actor_url,
+    verify_incoming_activity_signature, webfinger_response,
 };
 use kodamapub_db::{Database, DbError};
 use kodamapub_domain::{
     ActorProfile, ContentFormat, ContentSource, DomainError, FollowRelation, LocalActor, NewPost,
     Post, PostId, PublicBaseUrl, Username, Visibility,
 };
-use kodamapub_job::{JobError, RetryPolicy, activate_follow_and_backfill, enqueue_create_deliveries};
+use kodamapub_job::{
+    JobError, RetryPolicy, activate_follow_and_backfill, enqueue_create_deliveries,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower::ServiceBuilder;
@@ -271,6 +273,7 @@ fn build_app(state: Arc<AppState>, config: ServerConfig) -> Router {
             "/users/{username}/posts",
             get(list_user_posts).post(create_user_post),
         )
+        .route("/users/{username}/timeline", get(list_home_timeline))
         .with_state((state.clone(), config.clone()));
 
     let security_headers = ServiceBuilder::new()
@@ -313,6 +316,30 @@ async fn list_user_posts(
         .db
         .posts()
         .list_by_actor(actor.id(), query.before, limit)
+        .await?;
+    Ok(Json(PostPageResponse {
+        posts: page.posts,
+        next_cursor: page.next_cursor,
+    }))
+}
+
+async fn list_home_timeline(
+    State((state, _config)): State<(Arc<AppState>, ServerConfig)>,
+    Path(path): Path<UsernamePath>,
+    headers: HeaderMap,
+    Query(query): Query<ListPostsQuery>,
+) -> Result<Json<PostPageResponse>, ApiError> {
+    let session = require_authenticated_session(&state, &headers).await?;
+    let session_actor = find_local_actor_by_id(&state, session.actor_id).await?;
+    if session_actor.profile.username != path.username {
+        return Err(ApiError::Forbidden("cannot read another user's timeline"));
+    }
+
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
+    let page = state
+        .db
+        .posts()
+        .list_home_timeline(session_actor.id(), query.before, limit)
         .await?;
     Ok(Json(PostPageResponse {
         posts: page.posts,

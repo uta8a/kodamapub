@@ -58,6 +58,19 @@ export async function listPosts(
   return request(`/api/users/${encodeURIComponent(username)}/posts?${params.toString()}`);
 }
 
+export async function listTimeline(
+  username: string,
+  options?: { limit?: number; before?: string | null },
+): Promise<PostPage> {
+  const params = new URLSearchParams();
+  params.set("limit", String(options?.limit ?? 20));
+  if (options?.before) {
+    params.set("before", options.before);
+  }
+
+  return request(`/api/users/${encodeURIComponent(username)}/timeline?${params.toString()}`);
+}
+
 export async function getPost(postId: string): Promise<Post> {
   return request(`/api/posts/${encodeURIComponent(postId)}`);
 }

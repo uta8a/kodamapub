@@ -468,6 +468,10 @@ svg {
   border-top: 1px solid rgba(196, 189, 175, 0.9);
 }
 
+.timeline-summary {
+  margin-bottom: 14px;
+}
+
 .post-card {
   padding: 16px 0;
   border-bottom: 1px solid rgba(234, 229, 219, 1);

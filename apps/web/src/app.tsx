@@ -15,6 +15,7 @@ import {
   getPost,
   getSession,
   listPosts,
+  listTimeline,
   login,
   logout,
   setCsrfToken,
@@ -198,7 +199,7 @@ function AppShell({
   );
 }
 
-function FeedCard({ post, username }: { post: Post; username: string }) {
+function FeedCard({ post, linkUsername }: { post: Post; linkUsername: string | null }) {
   const body = useMemo(() => ({ __html: post.content_html }), [post.content_html]);
 
   return (
@@ -206,11 +207,16 @@ function FeedCard({ post, username }: { post: Post; username: string }) {
       <div className="post-meta">
         <span>{formatVisibility(post.visibility)}</span>
         <span>{formatContentFormat(post.content_format)}</span>
+        {!linkUsername ? <span>actor {post.actor_id}</span> : null}
         <time dateTime={post.created_at}>{formatDate(post.created_at)}</time>
       </div>
       <div className="post-body" dangerouslySetInnerHTML={body} />
       <div className="post-footer">
-        <Link to={postPath(username, post.id)}>開く</Link>
+        {linkUsername ? (
+          <Link to={postPath(linkUsername, post.id)}>開く</Link>
+        ) : (
+          <a href={post.url}>開く</a>
+        )}
         <span className="muted">{post.url}</span>
       </div>
     </article>
@@ -408,11 +414,13 @@ function TimelinePage({
   title,
   subtitle,
   composerUsername,
+  mode = "profile",
 }: {
   username: string;
   title: string;
   subtitle: string;
   composerUsername?: string;
+  mode?: "profile" | "home";
 }) {
   const [actor, setActor] = useState<ActorProfile | null>(null);
   const [posts, setPosts] = useState<Post[]>([]);
@@ -429,7 +437,10 @@ function TimelinePage({
       setPosts([]);
       setNextCursor(null);
       try {
-        const [actorData, postPage] = await Promise.all([getActor(username), listPosts(username)]);
+        const [actorData, postPage] = await Promise.all([
+          getActor(username),
+          mode === "home" ? listTimeline(username) : listPosts(username),
+        ]);
         if (cancelled) {
           return;
         }
@@ -448,7 +459,7 @@ function TimelinePage({
     return () => {
       cancelled = true;
     };
-  }, [username]);
+  }, [username, mode]);
 
   async function loadMore() {
     if (!nextCursor) {
@@ -459,7 +470,10 @@ function TimelinePage({
     setError(null);
 
     try {
-      const page = await listPosts(username, { before: nextCursor });
+      const page =
+        mode === "home"
+          ? await listTimeline(username, { before: nextCursor })
+          : await listPosts(username, { before: nextCursor });
       setPosts((current) => [...current, ...page.posts]);
       setNextCursor(page.next_cursor);
     } catch (cause) {
@@ -524,11 +538,23 @@ function TimelinePage({
           <span>{posts.length} 件</span>
         </div>
 
+        {mode === "home" ? (
+          <p className="summary timeline-summary">
+            自分の投稿と、Active な follow 先から inbox に届いた投稿を表示します。
+          </p>
+        ) : null}
+
         <div className="feed-list">
           {posts.length === 0 ? (
             <p className="muted">まだ投稿がありません。</p>
           ) : (
-            posts.map((post) => <FeedCard key={post.id} post={post} username={username} />)
+            posts.map((post) => (
+              <FeedCard
+                key={post.id}
+                post={post}
+                linkUsername={mode === "profile" || post.actor_id === actor?.id ? username : null}
+              />
+            ))
           )}
         </div>
 
@@ -559,8 +585,9 @@ function HomePage() {
     <TimelinePage
       username={actor.username}
       title="ホーム"
-      subtitle={`@${actor.username} に見える投稿を並べています。`}
+      subtitle={`@${actor.username} のタイムラインです。`}
       composerUsername={actor.username}
+      mode="home"
     />
   );
 }
@@ -624,7 +651,7 @@ function PostPage() {
         {error ? (
           <p className="error">{error}</p>
         ) : post ? (
-          <FeedCard post={post} username={username} />
+          <FeedCard post={post} linkUsername={username} />
         ) : (
           <p className="muted">投稿を読み込み中...</p>
         )}
