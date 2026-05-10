@@ -13,6 +13,10 @@ CA_CERT="${CERT_DIR}/kodamapub-e2e-ca.pem"
 CA_KEY="${CERT_DIR}/kodamapub-e2e-ca-key.pem"
 APP_CERT="${CERT_DIR}/app.localhost.pem"
 APP_KEY="${CERT_DIR}/app.localhost-key.pem"
+export KUBECONFIG="${KUBECONFIG:-tmp/kind-kubeconfig}"
+export HELM_CACHE_HOME="${HELM_CACHE_HOME:-tmp/helm-cache}"
+export HELM_CONFIG_HOME="${HELM_CONFIG_HOME:-tmp/helm-config}"
+export HELM_DATA_HOME="${HELM_DATA_HOME:-tmp/helm-data}"
 
 usage() {
   cat <<'USAGE'
@@ -21,6 +25,7 @@ Usage: scripts/kind/mastodon-e2e.sh <command>
 Commands:
   up            Create/update kind cluster and deploy kodamapub + Magout-managed Mastodon
   seed          Create kodamapub alice/password and Mastodon e2e user
+  test          Run the Mastodon interoperability E2E flow in kind
   port-forward  Forward UI ports: kodamapub 8443, Mastodon 3001
   status        Show pods, services, PVCs, and MastodonServer
   logs          Follow kodamapub and Mastodon logs
@@ -44,6 +49,8 @@ check_deps() {
   need kubectl
   need helm
   need openssl
+  mkdir -p "$(dirname "${KUBECONFIG}")"
+  mkdir -p "${HELM_CACHE_HOME}" "${HELM_CONFIG_HOME}" "${HELM_DATA_HOME}"
 }
 
 kind_cluster_exists() {
@@ -52,6 +59,7 @@ kind_cluster_exists() {
 
 create_cluster() {
   if kind_cluster_exists; then
+    kind export kubeconfig --name "${CLUSTER_NAME}" >/dev/null
     return
   fi
 
@@ -97,7 +105,19 @@ generate_certs() {
 }
 
 build_and_load_images() {
-  docker buildx bake --file docker-bake.hcl --load
+  local buildx_config="${BUILDX_CONFIG:-}"
+
+  if [[ -z "${buildx_config}" && -z "${CI:-}" ]]; then
+    buildx_config="tmp/buildx"
+  fi
+
+  if [[ -n "${buildx_config}" ]]; then
+    mkdir -p "${buildx_config}"
+    BUILDX_CONFIG="${buildx_config}" docker buildx bake --file docker-bake.hcl --load
+  else
+    docker buildx bake --file docker-bake.hcl --load
+  fi
+
   kind load docker-image --name "${CLUSTER_NAME}" \
     kodamapub-edge:latest \
     kodamapub-server:latest \
@@ -612,10 +632,99 @@ EOF
 }
 
 seed_mastodon_user() {
-  local pod password
+  local password
+
+  password="$(create_mastodon_user)"
+
+  printf 'Mastodon user: e2e@uta8a.org\n'
+  printf 'Mastodon password: %s\n' "${password}"
+}
+
+mastodon_web_pod() {
+  local pod
+
   pod="$(kubectl -n "${NAMESPACE}" get pod \
     -l app.kubernetes.io/component=web,app.kubernetes.io/part-of=mastodon \
     -o jsonpath='{.items[0].metadata.name}')"
+  printf '%s\n' "${pod}"
+}
+
+yaml_single_quote() {
+  printf "'%s'" "$(sed "s/'/''/g" <<<"$1")"
+}
+
+run_kodamapub_cli_job() {
+  local job_name="$1"
+  shift
+
+  kubectl -n "${NAMESPACE}" delete job "${job_name}" --ignore-not-found >/dev/null
+  kubectl -n "${NAMESPACE}" wait --for=delete "job/${job_name}" --timeout=60s >/dev/null 2>&1 || true
+  {
+    cat <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${job_name}
+  namespace: ${NAMESPACE}
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: cli
+          image: kodamapub-cli-job:latest
+          imagePullPolicy: Never
+          args:
+EOF
+    local arg
+    for arg in "$@"; do
+      printf '            - %s\n' "$(yaml_single_quote "${arg}")"
+    done
+    cat <<'EOF'
+          env:
+            - {name: DATABASE_URL, value: "sqlite:///data/kodamapub.db?mode=rwc"}
+            - {name: KODAMAPUB_REMOTE_CA_CERT_PATH, value: "/certs/kodamapub-e2e-ca.pem"}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: certs, mountPath: /certs, readOnly: true}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: kodamapub-data}
+        - name: certs
+          secret: {secretName: kodamapub-e2e-certs}
+EOF
+  } | kubectl apply -f - >/dev/null
+
+  if ! kubectl -n "${NAMESPACE}" wait --for=condition=complete "job/${job_name}" --timeout=180s >/dev/null; then
+    kubectl -n "${NAMESPACE}" logs "job/${job_name}" --all-containers >&2 || true
+    return 1
+  fi
+}
+
+create_test_local_actor() {
+  local username="$1"
+
+  run_kodamapub_cli_job "kodamapub-create-${username}" \
+    create-local-actor \
+    --public-base-url "${KODAMAPUB_ORIGIN}" \
+    --username "${username}" \
+    --display-name Alice \
+    --summary "GitHub Actions E2E actor" \
+    --password password
+}
+
+create_mastodon_app() {
+  local pod
+  pod="$(mastodon_web_pod)"
+
+  kubectl -n "${NAMESPACE}" exec "${pod}" -- bash -lc \
+    'RAILS_ENV=production bundle exec rails runner '\''app = Doorkeeper::Application.find_or_initialize_by(name: "kodamapub-e2e"); app.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"; app.scopes = "read:accounts read:follows read:statuses write:accounts write:follows"; app.website = "https://example.invalid"; app.save!; puts app.uid'\'''
+}
+
+create_mastodon_user() {
+  local pod password
+  pod="$(mastodon_web_pod)"
 
   password="$(
     kubectl -n "${NAMESPACE}" exec "${pod}" -- \
@@ -631,8 +740,334 @@ seed_mastodon_user() {
     )"
   fi
 
-  printf 'Mastodon user: e2e@uta8a.org\n'
-  printf 'Mastodon password: %s\n' "${password}"
+  if [[ -z "${password}" ]]; then
+    printf 'failed to obtain Mastodon password from tootctl output\n' >&2
+    return 1
+  fi
+
+  printf '%s\n' "${password}"
+}
+
+create_mastodon_user_token() {
+  local client_id="$1"
+  local pod
+  pod="$(mastodon_web_pod)"
+
+  kubectl -n "${NAMESPACE}" exec "${pod}" -- bash -lc \
+    'CLIENT_ID="$0" USER_EMAIL="$1" RAILS_ENV=production bundle exec rails runner '\''app = Doorkeeper::Application.find_by!(uid: ENV.fetch("CLIENT_ID")); user = User.where(email: ENV.fetch("USER_EMAIL")).order(created_at: :desc).first!; token = Doorkeeper::AccessToken.create_for(application: app, resource_owner: user, scopes: "read:accounts read:follows read:statuses write:accounts write:follows"); puts token.token'\''' \
+    "${client_id}" "e2e@uta8a.org"
+}
+
+lookup_remote_account_id() {
+  local username="$1"
+  local pod
+  pod="$(mastodon_web_pod)"
+
+  kubectl -n "${NAMESPACE}" exec "${pod}" -- bash -lc \
+    'RAILS_ENV=production bundle exec rails runner '\''account = ActivityPub::FetchRemoteAccountService.new.call("https://kodamapub.e2e/users/'"${username}"'"); puts account.id'\'''
+}
+
+start_port_forwards() {
+  kubectl -n "${NAMESPACE}" port-forward service/edge 8443:443 >/tmp/kodamapub-edge-port-forward.log 2>&1 &
+  EDGE_PORT_FORWARD_PID="$!"
+  kubectl -n "${NAMESPACE}" port-forward service/mastodon-proxy 3001:3001 >/tmp/kodamapub-mastodon-port-forward.log 2>&1 &
+  MASTODON_PORT_FORWARD_PID="$!"
+}
+
+stop_port_forwards() {
+  if [[ -n "${EDGE_PORT_FORWARD_PID:-}" ]]; then
+    kill "${EDGE_PORT_FORWARD_PID}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${MASTODON_PORT_FORWARD_PID:-}" ]]; then
+    kill "${MASTODON_PORT_FORWARD_PID}" >/dev/null 2>&1 || true
+  fi
+}
+
+curl_request() {
+  local label="$1"
+  local resolve_host="$2"
+  local resolve_port="$3"
+  shift 3
+
+  printf 'curl[%s]: %s\n' "$label" "$*" >&2
+  curl --cacert "${CA_CERT}" \
+    --resolve "${resolve_host}:${resolve_port}:127.0.0.1" \
+    -fsS --retry 5 --retry-all-errors --retry-connrefused --retry-delay 1 "$@"
+}
+
+wait_for_http() {
+  local host="$1"
+  local port="$2"
+  local url="$3"
+  local label="$4"
+  local attempt
+
+  for attempt in $(seq 1 60); do
+    if curl_request "$label" "$host" "$port" "$url" >/dev/null; then
+      printf 'ready: %s\n' "$label"
+      return 0
+    fi
+
+    sleep 5
+  done
+
+  printf 'timed out waiting for %s (%s)\n' "$label" "$url" >&2
+  return 1
+}
+
+wait_for_mastodon_instance() {
+  local attempt
+
+  for attempt in $(seq 1 60); do
+    if curl_request "mastodon instance" "mastodon.e2e" "3001" \
+      https://mastodon.e2e:3001/api/v1/instance >/dev/null; then
+      printf 'ready: %s\n' "mastodon instance"
+      return 0
+    fi
+
+    sleep 5
+  done
+
+  printf 'timed out waiting for mastodon instance\n' >&2
+  return 1
+}
+
+login_local_actor() {
+  local cookie_jar="$1"
+  local username="$2"
+  local login_output
+
+  login_output="$(
+    curl_request "login local actor" "kodamapub.e2e" "8443" \
+      -c "${cookie_jar}" \
+      -H 'Origin: https://kodamapub.e2e:8443' \
+      -H 'Content-Type: application/json' \
+      -d '{
+        "username": "'"${username}"'",
+        "password": "password"
+      }' \
+      https://kodamapub.e2e:8443/api/login
+  )"
+
+  jq -r '.csrf_token' <<<"${login_output}"
+}
+
+create_local_post() {
+  local cookie_jar="$1"
+  local csrf_token="$2"
+  local content_source="$3"
+  local username="$4"
+
+  curl_request "create local post" "kodamapub.e2e" "8443" -X POST \
+    -b "${cookie_jar}" \
+    -H 'Origin: https://kodamapub.e2e:8443' \
+    -H "x-csrf-token: ${csrf_token}" \
+    -H 'Content-Type: application/json' \
+    -d "$(jq -nc --arg content_source "${content_source}" '{
+      content_source: $content_source,
+      content_format: "Plaintext",
+      visibility: "Public",
+      in_reply_to: null
+    }')" \
+    "https://kodamapub.e2e:8443/api/users/${username}/posts" >/dev/null
+}
+
+follow_remote_account() {
+  local token="$1"
+  local remote_id="$2"
+
+  curl_request "mastodon follow" "mastodon.e2e" "3001" -X POST \
+    -H "Authorization: Bearer ${token}" \
+    "https://mastodon.e2e:3001/api/v1/accounts/${remote_id}/follow" >/dev/null
+}
+
+unfollow_remote_account() {
+  local token="$1"
+  local remote_id="$2"
+
+  curl_request "mastodon unfollow" "mastodon.e2e" "3001" -X POST \
+    -H "Authorization: Bearer ${token}" \
+    "https://mastodon.e2e:3001/api/v1/accounts/${remote_id}/unfollow" >/dev/null
+}
+
+run_delivery_jobs() {
+  run_kodamapub_cli_job "kodamapub-deliver-$(date +%s)-${RANDOM}" \
+    run-deliveries --limit 100 >/dev/null
+}
+
+wait_for_follow_state() {
+  local expected="$1"
+  local remote_id="$2"
+  local token="$3"
+  local attempt relationship value
+
+  for attempt in $(seq 1 40); do
+    run_delivery_jobs
+
+    if ! relationship="$(curl_request "mastodon relationships" \
+      "mastodon.e2e" "3001" \
+      -H "Authorization: Bearer ${token}" \
+      --get \
+      --data-urlencode "id[]=${remote_id}" \
+      https://mastodon.e2e:3001/api/v1/accounts/relationships)"; then
+      sleep 3
+      continue
+    fi
+
+    value="$(jq -r '.[0].following' <<<"${relationship}")"
+    if [[ "${value}" == "${expected}" ]]; then
+      return 0
+    fi
+
+    sleep 3
+  done
+
+  printf 'timed out waiting for relationship following=%s for account %s\n' "$expected" "$remote_id" >&2
+  return 1
+}
+
+wait_for_remote_post_content() {
+  local token="$1"
+  local remote_id="$2"
+  local expected_content="$3"
+  local attempt statuses
+
+  for attempt in $(seq 1 40); do
+    run_delivery_jobs
+
+    if ! statuses="$(
+      curl_request "mastodon statuses" \
+        "mastodon.e2e" "3001" \
+        -H "Authorization: Bearer ${token}" \
+        --get \
+        --data-urlencode "limit=20" \
+        "https://mastodon.e2e:3001/api/v1/accounts/${remote_id}/statuses"
+    )"; then
+      sleep 3
+      continue
+    fi
+
+    if jq -e --arg expected "${expected_content}" '
+      any(.[]; (.content // "") | contains($expected))
+    ' <<<"${statuses}" >/dev/null; then
+      return 0
+    fi
+
+    sleep 3
+  done
+
+  printf 'timed out waiting for mastodon to expose post content for account %s\n' "$remote_id" >&2
+  return 1
+}
+
+run_repeated_post_delivery_case() {
+  local token="$1"
+  local username remote_id cookie_jar csrf_token first_post second_post
+
+  username="alice-repeat-$(openssl rand -hex 8)"
+  first_post="Mastodon E2E repeated post first $(openssl rand -hex 4)"
+  second_post="Mastodon E2E repeated post second $(openssl rand -hex 4)"
+
+  create_test_local_actor "${username}"
+  cookie_jar="$(mktemp)"
+  csrf_token="$(login_local_actor "${cookie_jar}" "${username}")"
+
+  remote_id="$(lookup_remote_account_id "${username}")"
+  if [[ -z "${remote_id}" || "${remote_id}" == "null" ]]; then
+    printf 'failed to resolve remote account id for %s@kodamapub.e2e\n' "${username}" >&2
+    return 1
+  fi
+
+  follow_remote_account "${token}" "${remote_id}"
+  wait_for_follow_state true "${remote_id}" "${token}"
+
+  create_local_post "${cookie_jar}" "${csrf_token}" "${first_post}" "${username}"
+  wait_for_remote_post_content "${token}" "${remote_id}" "${first_post}"
+
+  create_local_post "${cookie_jar}" "${csrf_token}" "${second_post}" "${username}"
+  wait_for_remote_post_content "${token}" "${remote_id}" "${second_post}"
+
+  unfollow_remote_account "${token}" "${remote_id}"
+  wait_for_follow_state false "${remote_id}" "${token}"
+}
+
+assert_no_server_errors() {
+  local logs
+  logs="$(kubectl -n "${NAMESPACE}" logs deployment/server --all-containers --timestamps || true)"
+  logs+=$'\n'
+  logs+="$(kubectl -n "${NAMESPACE}" logs deployment/delivery-worker --all-containers --timestamps || true)"
+
+  if grep -Eq 'request failed|missing signature header|signature verification failed|invalid remote resource|UNIQUE constraint failed' <<<"${logs}"; then
+    printf 'server logs contained an unexpected error:\n' >&2
+    grep -En 'request failed|missing signature header|signature verification failed|invalid remote resource|UNIQUE constraint failed' <<<"${logs}" >&2
+    return 1
+  fi
+}
+
+dump_debug_logs() {
+  kubectl -n "${NAMESPACE}" get pods,svc,pvc,mastodonserver >&2 || true
+  kubectl -n "${NAMESPACE}" logs deployment/server --all-containers --timestamps >&2 || true
+  kubectl -n "${NAMESPACE}" logs deployment/delivery-worker --all-containers --timestamps >&2 || true
+  kubectl -n "${NAMESPACE}" logs \
+    -l app.kubernetes.io/part-of=mastodon \
+    --all-containers \
+    --max-log-requests=12 \
+    --timestamps >&2 || true
+}
+
+cmd_test() {
+  check_deps
+  need curl
+  need jq
+
+  local client_id user_token remote_account_id
+  local local_cookie_jar post_content csrf_token local_username
+
+  trap 'status=$?; stop_port_forwards; if [ "$status" -ne 0 ]; then dump_debug_logs; fi; kind delete cluster --name "${CLUSTER_NAME}" >/dev/null 2>&1 || true; exit "$status"' EXIT
+
+  cmd_up
+  start_port_forwards
+  wait_for_http "kodamapub.e2e" "8443" "https://kodamapub.e2e:8443/health" "kodamapub edge"
+  wait_for_mastodon_instance
+
+  local_username="alice-$(openssl rand -hex 8)"
+  create_test_local_actor "${local_username}"
+  local_cookie_jar="$(mktemp)"
+  post_content="Mastodon E2E kodamapub post"
+  csrf_token="$(login_local_actor "${local_cookie_jar}" "${local_username}")"
+
+  client_id="$(create_mastodon_app)"
+  create_mastodon_user >/dev/null
+  user_token="$(create_mastodon_user_token "${client_id}")"
+
+  if [[ -z "${user_token}" || "${user_token}" == "null" ]]; then
+    printf 'failed to obtain Mastodon user token\n' >&2
+    return 1
+  fi
+
+  remote_account_id="$(lookup_remote_account_id "${local_username}")"
+  if [[ -z "${remote_account_id}" || "${remote_account_id}" == "null" ]]; then
+    printf 'failed to resolve remote account id for %s@kodamapub.e2e\n' "${local_username}" >&2
+    return 1
+  fi
+
+  for _ in 1 2; do
+    follow_remote_account "${user_token}" "${remote_account_id}"
+    wait_for_follow_state true "${remote_account_id}" "${user_token}"
+
+    if [[ -z "${posted_once:-}" ]]; then
+      create_local_post "${local_cookie_jar}" "${csrf_token}" "${post_content}" "${local_username}"
+      wait_for_remote_post_content "${user_token}" "${remote_account_id}" "${post_content}"
+      posted_once=true
+    fi
+
+    unfollow_remote_account "${user_token}" "${remote_account_id}"
+    wait_for_follow_state false "${remote_account_id}" "${user_token}"
+  done
+
+  run_repeated_post_delivery_case "${user_token}"
+
+  assert_no_server_errors
 }
 
 cmd_up() {
@@ -691,6 +1126,7 @@ cmd_down() {
 case "${1:-}" in
   up) cmd_up ;;
   seed) cmd_seed ;;
+  test) cmd_test ;;
   port-forward) cmd_port_forward ;;
   status) cmd_status ;;
   logs) cmd_logs ;;

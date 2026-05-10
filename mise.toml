@@ -46,6 +46,10 @@ run = "scripts/kind/mastodon-e2e.sh up"
 description = "Seed alice in kodamapub and e2e in Mastodon"
 run = "scripts/kind/mastodon-e2e.sh seed"
 
+[tasks.kind-mastodon-test]
+description = "Run the Mastodon interoperability E2E flow in kind"
+run = "scripts/kind/mastodon-e2e.sh test"
+
 [tasks.kind-mastodon-port-forward]
 description = "Forward local UI ports for the kind Mastodon E2E stack"
 run = "scripts/kind/mastodon-e2e.sh port-forward"

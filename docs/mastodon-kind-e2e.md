@@ -28,6 +28,14 @@ Keep the port-forward process running, then open:
 
 The certificate is generated under `tmp/kind-certs`. Browsers will warn because the local CA is not trusted by the OS.
 
+## Automated E2E
+
+```sh
+mise run kind-mastodon-test
+```
+
+The automated flow creates a fresh kind cluster, deploys kodamapub and Magout-managed Mastodon, creates a temporary kodamapub actor, follows it from Mastodon, verifies a public post is visible in Mastodon, verifies unfollow, and deletes the cluster on exit.
+
 ## Test Accounts
 
 - kodamapub: `alice` / `password`
